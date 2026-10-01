@@ -82,7 +82,7 @@ def parameter_estimation(key, link: ClassicalLink, sample_fraction: float = 0.20
                          qber_threshold: float = _DEFAULT_QBER_MAX,
                          eps_pe: float = 2.5e-10, verbose: bool = True) -> PEResult:
     """
-    Estima a QBER numa amostra aleatória da chave peneirada (PDF, seção 4.2.1).
+    Estima a QBER numa amostra aleatória da chave peneirada ((Wolf, 2021), seção 4.2.1).
 
     Alice sorteia `sample_fraction` das posições (com `secrets`, sem
     reposição -- requisito do teorema de Serfling), revela posições e bits;
@@ -155,7 +155,7 @@ def parameter_estimation(key, link: ClassicalLink, sample_fraction: float = 0.20
 # 2. CORREÇÃO DE ERROS
 # =============================================================================
 def _finish_ec(key_in, res, qber, link, method, eps_cor, verbose) -> ECResult:
-    """Verificação por hash 2-universal (PDF, seção 4.2.2) + estatísticas."""
+    """Verificação por hash 2-universal ((Wolf, 2021), seção 4.2.2) + estatísticas."""
     key_out = as_bits(res["key"])
     leak = int(res["leaked"])
     n_in = len(key_in)
@@ -266,7 +266,7 @@ def privacy_amp(key, link: ClassicalLink, qber_upper: float, leaked_bits: int,
                 eps_sec: float = 1e-9, verbose: bool = True) -> PAResult:
     """
     Amplificação de privacidade por hash de Toeplitz (família 2-universal),
-    com o comprimento dado pelo Quantum Leftover Hash Lemma (PDF, Lema 4.9):
+    com o comprimento dado pelo Quantum Leftover Hash Lemma ((Wolf, 2021), Lema 4.9):
 
         l = floor( n (1 - h2(e_fase)) - leaked_bits + 2 - 2 log2(1/eps_pa) )
 

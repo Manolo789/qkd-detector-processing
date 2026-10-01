@@ -255,7 +255,7 @@ def make_local_link_pair():
 
 
 # =============================================================================
-# 3. ESTIMAÇÃO DE PARÂMETROS -- limite de Serfling (PDF, Teorema 4.5, eq. 4.34)
+# 3. ESTIMAÇÃO DE PARÂMETROS -- limite de Serfling ((Wolf, 2021), Teorema 4.5, eq. 4.34)
 # =============================================================================
 def serfling_mu(n_rest: int, k_sample: int, eps: float) -> float:
     """
@@ -650,7 +650,7 @@ def toeplitz_hash(seed_bits: np.ndarray, x: np.ndarray, m: int) -> np.ndarray:
 
 
 def verify_alice(key: np.ndarray, link: ClassicalLink, eps_cor: float) -> Dict:
-    """Confirma que as chaves ficaram idênticas (PDF, seção 4.2.2): Alice envia
+    """Confirma que as chaves ficaram idênticas ((Wolf, 2021), seção 4.2.2): Alice envia
     a função de hash (semente) e a saída de ceil(log2(1/eps_cor)) bits."""
     m = int(math.ceil(math.log2(1.0 / eps_cor)))
     seed = random_bits(len(key) + m - 1)
@@ -672,7 +672,7 @@ def verify_bob(key: np.ndarray, link: ClassicalLink) -> Dict:
 
 def secret_key_length(n: int, e_phase: float, leaked_bits: int, eps_pa: float) -> int:
     """
-    Comprimento seguro da chave final (PDF, Lema 4.9 / eq. 4.44):
+    Comprimento seguro da chave final ((Wolf, 2021), Lema 4.9 / eq. 4.44):
 
         l = floor( H_min - leak_EC - leak_verif  + 2 - 2 log2(1/eps_pa) )
 
