@@ -1,0 +1,1535 @@
+################################################################################
+#                                                                              #
+#   DOCUMENTAÇÃO TÉCNICA                                                       #
+#   Sistema de QKD baseado em emaranhamento (BBM92) com hardware simulado      #
+#   e pós-processamento clássico completo                                      #
+#                                                                              #
+#   Arquivos cobertos: ALICE.py, BOB.py, BBM92.py, SIMLINK.py,                 #
+#                      CLASSIC_CHANNEL.py, AUXILIARY.py, POSTPROCESS.py        #
+#                                                                              #
+################################################################################
+
+
+SUMÁRIO
+=======
+  1.  Visão geral
+  2.  Estrutura do projeto e dependências entre módulos
+  3.  Requisitos e preparação do ambiente
+  4.  Guia de execução
+  5.  Fluxo completo da sessão (passo a passo)
+  6.  Referência: SIMLINK.py       (hardware simulado)
+  7.  Referência: BBM92.py         (aquisição e sifting)
+  8.  Referência: CLASSIC_CHANNEL.py (canal TCP persistente)
+  9.  Referência: AUXILIARY.py     (primitivas do pós-processamento)
+  10. Referência: POSTPROCESS.py   (PE -> EC -> PA -> AUTH)
+  11. Referência: ALICE.py e BOB.py (programas principais)
+  12. Mensagens trocadas na rede (formato por fase)
+  13. Parâmetros de segurança e fórmulas
+  14. Desempenho e dimensionamento (medições)
+  15. Solução de problemas
+  16. Observações, limitações e pontos de atenção do código
+  17. Migração para hardware real
+  18. Glossário
+  19. Referências citadas nos códigos
+
+Convenções deste documento
+--------------------------
+  * "Nó" = um dos dois programas (Alice ou Bob), cada um em um computador.
+  * Chaves são vetores NumPy `uint8` com valores 0/1.
+  * Valores numéricos marcados como "medido" vêm de execuções de validação
+    feitas especificamente para esta documentação (ver seção 14); valores
+    marcados como "estimativa" são derivados dos parâmetros do código.
+
+
+================================================================================
+1. VISÃO GERAL
+================================================================================
+
+1.1 O que o sistema faz
+-----------------------
+O projeto implementa, em Python, uma cadeia completa de distribuição quântica
+de chaves (QKD) por emaranhamento, segundo o protocolo BBM92 (Bennett, Brassard
+e Mermin, 1992), entre dois nós, Alice e Bob, que rodam em computadores
+DIFERENTES ligados por uma rede TCP/IP.
+
+A cadeia é:
+
+   captura de time tags (SPADs)
+        |
+        v
+   coincidências + sifting (BBM92)             <- BBM92.py / ALICE.py / BOB.py
+        |
+        v
+   estimação de parâmetros (QBER, Serfling)    \
+        |                                       |
+        v                                       |
+   correção de erros (Cascade ou LDPC)          |  POSTPROCESS.py
+        |                                       |  (usa AUXILIARY.py)
+        v                                       |
+   verificação por hash 2-universal             |
+        |                                       |
+        v                                       |
+   amplificação de privacidade (Toeplitz)       |
+        |                                       |
+        v                                       |
+   autenticação Wegman-Carter da transcrição   /
+        |
+        v
+   chave secreta final
+
+1.2 O protocolo BBM92 em poucas linhas
+--------------------------------------
+Uma fonte emite pares de fótons emaranhados no estado singleto |Psi->. Um fóton
+vai para Alice e outro para Bob. Cada um, independentemente e ao acaso, mede
+na base Z (polarizações H/V) ou na base X (polarizações D/A). Depois, por um
+canal clássico público (autenticado), eles comparam apenas as BASES usadas (e
+os instantes das detecções), nunca os bits:
+
+  * bases iguais    -> o resultado de Bob é ANTICORRELACIONADO com o de Alice
+                       (por isso Bob inverte seus bits no sifting);
+  * bases diferentes -> o evento é descartado.
+
+Os eventos que sobram formam a "chave peneirada" (sifted key). Pequenos erros
+(ruído, imperfeições) e eventual espionagem aparecem como taxa de erro de bit
+(QBER). O pós-processamento transforma a chave peneirada, ruidosa e parcialmente
+conhecida por um espião, numa chave idêntica nos dois lados e secreta.
+
+1.3 Mapeamento de canais do time tagger
+---------------------------------------
+Cada nó usa 4 canais de detecção, um por polarização:
+
+   Nó     H    V    D    A      Base Z (H/V)         Base X (D/A)
+   -----  ---  ---  ---  ---    -------------------  -------------------
+   Alice   1    2    3    4     1 -> bit 0, 2 -> 1   3 -> bit 0, 4 -> 1
+   Bob     5    6    7    8     5 -> bit 0, 6 -> 1   7 -> bit 0, 8 -> 1
+
+Esse mapeamento está em `BBM92HardwareManager.channels` (por nó) e em
+`BBM92ProtocolEngine.channel_map` (canal -> (base, bit)). O SIMLINK.py repete a
+mesma tabela (`ALICE_CHANNELS`, `BOB_CHANNELS`, `CHANNEL_MAP`).
+
+1.4 Hardware simulado
+---------------------
+Por padrão o projeto NÃO precisa de nenhum equipamento: o SIMLINK.py injeta um
+módulo "Swabian.TimeTagger" falso em `sys.modules` que gera, por Monte Carlo,
+timestamps e canais fisicamente plausíveis (fonte SPDC, jitter, perdas, dark
+counts, QBER intrínseca, espiã opcional). Detalhes na seção 6. A seção 17
+descreve como trocar pelo hardware real.
+
+IMPORTANTE: a simulação existe para testar e demonstrar a cadeia de software.
+Como os dois processos sorteiam o "mundo quântico" a partir da MESMA semente
+(seção 6.2), a simulação em si não tem valor criptográfico; o que se valida é
+o pipeline de coincidência, sifting e pós-processamento.
+
+
+================================================================================
+2. ESTRUTURA DO PROJETO E DEPENDÊNCIAS ENTRE MÓDULOS
+================================================================================
+
+2.1 Arquivos
+------------
+  ALICE.py            Programa principal do nó Alice (servidor TCP). Captura,
+                      faz o sifting, chama o pós-processamento e imprime o
+                      resultado.
+  BOB.py              Programa principal do nó Bob (cliente TCP). Espelho de
+                      ALICE.py, com os papéis invertidos.
+  BBM92.py            `BBM92HardwareManager` (interface com o Time Tagger) e
+                      `BBM92ProtocolEngine` (mapeamento canal->base/bit e
+                      sifting por coincidência temporal).
+  SIMLINK.py          Backend simulado do driver Swabian TimeTagger + modelo
+                      físico do enlace emaranhado.
+  CLASSIC_CHANNEL.py  Canal clássico TCP persistente, de porta única, com
+                      mensagens de tamanho arbitrário (`AliceClassicalChannel`
+                      e `BobClassicalChannel`).
+  AUXILIARY.py        Algoritmos do pós-processamento: ClassicalLink, limite de
+                      Serfling, Cascade, LDPC, hash de Toeplitz, autenticação
+                      Wegman-Carter, reservatório de chave de autenticação e
+                      dataclasses de resultado. Uso restrito ao POSTPROCESS.py.
+  POSTPROCESS.py      API de alto nível: parameter_estimation,
+                      error_correction_*, privacy_amp, authentication e o
+                      orquestrador run_postprocessing.
+
+2.2 Grafo de dependências
+-------------------------
+  ALICE.py / BOB.py
+    |-- SIMLINK.py            (install_simulated_hardware)
+    |-- BBM92.py
+    |     '-- SIMLINK.py      (BBM92.py também instala o hardware simulado)
+    |           '--> registra em sys.modules o módulo "Swabian.TimeTagger"
+    |                que BBM92.py importa como `TT`
+    |-- CLASSIC_CHANNEL.py    (AliceClassicalChannel / BobClassicalChannel)
+    |-- AUXILIARY.py
+    |     '-- CLASSIC_CHANNEL.py   (só para checar o tipo do canal)
+    '-- POSTPROCESS.py
+          '-- AUXILIARY.py
+
+2.3 Divisão de responsabilidades
+--------------------------------
+  * Específico do protocolo QUÂNTICO (BBM92): BBM92.py, ALICE.py, BOB.py.
+    O sifting fica aqui porque depende de bases e de coincidências.
+  * Independente de protocolo e de nó: POSTPROCESS.py + AUXILIARY.py.
+    Alice e Bob chamam as MESMAS funções, com o mesmo roteiro; o papel de cada
+    um vem de `link.role` ('alice' ou 'bob').
+  * Transporte: CLASSIC_CHANNEL.py (conexão TCP) e `ClassicalLink`
+    (AUXILIARY.py), que adapta o canal ao pós-processamento e grava a
+    transcrição usada na autenticação.
+
+
+================================================================================
+3. REQUISITOS E PREPARAÇÃO DO AMBIENTE
+================================================================================
+
+3.1 Software
+------------
+  * Python 3.8 ou superior (as validações desta documentação usaram 3.12).
+  * NumPy (única dependência de terceiros no modo simulado; validado com
+    NumPy 2.4).
+  * Bibliotecas padrão usadas: json, os, socket, struct, time, secrets, math,
+    queue, io, contextlib, dataclasses, argparse, runpy, types, sys.
+  * Só para hardware real: `pip install Swabian-TimeTagger` (Linux/Windows).
+
+3.2 Instalação dos arquivos
+---------------------------
+Copie os 7 arquivos .py para um mesmo diretório em CADA uma das duas máquinas.
+
+3.3 Rede
+--------
+  * As duas máquinas devem se enxergar na rede (mesma LAN, por exemplo).
+  * Libere no firewall de Alice a porta TCP escolhida (padrão 65432), pois
+    Alice é o SERVIDOR.
+  * Bob precisa do IP real de Alice. `BobClassicalChannel` RECUSA "localhost",
+    "127.0.0.1" e "::1" (levanta ValueError). Para testar numa única máquina,
+    use o IP da interface de rede dela (o servidor escuta em 0.0.0.0).
+
+3.4 Mesma versão do NumPy nas duas máquinas
+-------------------------------------------
+O modo simulado depende de `numpy.random.default_rng(seed)` produzir
+EXATAMENTE a mesma sequência nos dois processos. O NumPy não garante que as
+sequências do `Generator` sejam idênticas entre versões diferentes. Use a mesma
+versão de NumPy em Alice e Bob, ou os dois lados "enxergarão" mundos simulados
+diferentes e não haverá coincidências.
+
+3.5 Chave pré-compartilhada de autenticação
+-------------------------------------------
+A autenticação Wegman-Carter exige um segredo prévio. Gere UMA vez:
+
+    python AUXILIARY.py --gen-auth-key auth_key.json 8192
+
+e copie o MESMO arquivo, por um meio seguro (pendrive, canal já autenticado
+etc., nunca pela rede do experimento), para Alice e Bob. Ambos precisam
+partir do mesmo conteúdo e da mesma posição (`pos`).
+
+  * Cada sessão consome 381 bits (= 3 x 127) do reservatório.
+  * Com 8192 bits, e sem reposição, bastam para 21 sessões.
+  * Quando a chave final tem mais de 381 bits, 381 deles voltam ao
+    reservatório (reposição automática, `replenish_auth=True`), de modo que
+    o consumo líquido é nulo. Essa é a ideia de "autossustentação" do QKD.
+  * O arquivo é um JSON {"n": <nº de bits>, "pos": <bits já consumidos>,
+    "bits": <hex>}, gravado de forma atômica (arquivo .tmp + os.replace).
+    NÃO reutilize, nem restaure de um backup antigo: bits de one-time pad
+    nunca podem ser usados duas vezes.
+
+
+================================================================================
+4. GUIA DE EXECUÇÃO
+================================================================================
+
+4.1 Passo a passo
+-----------------
+  1. (uma vez) Gere e distribua a chave de autenticação (seção 3.5).
+
+  2. Na máquina de ALICE (inicie primeiro):
+
+         python ALICE.py
+
+     Ela imprime o IP local, ex.:
+         [ALICE] IP desta máquina na rede (configure ALICE_HOST em BOB.py ...): 192.168.1.10
+     e fica aguardando a conexão de Bob em 0.0.0.0:65432.
+
+  3. Na máquina de BOB, informe o IP de Alice:
+
+         # Linux/macOS
+         ALICE_HOST=192.168.1.10 python BOB.py
+         # Windows (PowerShell)
+         $env:ALICE_HOST="192.168.1.10"; python BOB.py
+         # Windows (cmd)
+         set ALICE_HOST=192.168.1.10 && python BOB.py
+
+     Bob tenta conectar repetidamente (a cada 0,5 s, por até 30 s). Se
+     ALICE_HOST estiver vazio, BOB.py encerra com instruções.
+
+  4. Os dois programas executam toda a sessão automaticamente e imprimem o
+     resultado. Em caso de sucesso ambos terminam com "[SUCESSO] ...".
+
+4.2 Variáveis de ambiente
+-------------------------
+  Variável      Padrão           Lida por     Descrição
+  ------------  ---------------  -----------  ---------------------------------
+  EC_METHOD     cascade          Alice, Bob   'cascade' ou 'ldpc'. DEVE ser igual
+                                              nos dois nós.
+  AUTH_KEY_FILE auth_key.json    Alice, Bob   Caminho do reservatório de chave
+                                              de autenticação (cópias idênticas).
+  CAPTURE_S     0.01             Alice, Bob   Duração da captura em segundos.
+                                              DEVE ser igual nos dois nós.
+  CLASSIC_PORT  65432            Alice, Bob   Porta TCP única. DEVE ser igual.
+  ALICE_HOST    (vazio)          só Bob       IP de Alice. Obrigatória em Bob.
+
+ATENÇÃO ao padrão de CAPTURE_S: com 0,01 s a simulação produz apenas ~15 bits
+peneirados (medido) e a chave final sai VAZIA. Isso não é defeito: o custo de
+tamanho finito consome tudo (seção 13). Para obter chave, use capturas de
+alguns segundos (seção 14):
+
+         CAPTURE_S=2 python ALICE.py
+         CAPTURE_S=2 ALICE_HOST=192.168.1.10 python BOB.py
+
+4.3 Parâmetros fixos no código (editar nos dois arquivos, de forma idêntica)
+---------------------------------------------------------------------------
+  * Em ALICE.py / BOB.py:
+      - `SIMLINK.install_simulated_hardware(pair_rate_hz=3e6,
+         eve_intercept_resend=False, seed=42)`: taxa de pares, presença de
+         espiã e semente da simulação. Mude `eve_intercept_resend=True`
+         em AMBOS para demonstrar a detecção de espionagem.
+      - Janela de coincidência: `BBM92ProtocolEngine(coincidence_window_ps=800)`.
+      - Atrasos de calibração: `hw.calibrate_delays({...})` (valores
+        diferentes por nó, ver 11.2).
+  * Em `run_postprocessing(...)`, não expostos por variável de ambiente:
+    sample_fraction (0,20), qber_threshold (0,11), eps_sec (1e-9),
+    eps_cor (1e-10), replenish_auth (True), ec_kwargs (n_passes, frame_size,
+    ladder...). Qualquer alteração deve ser feita igual nos dois nós.
+
+4.4 Exemplo de saída do pós-processamento (log real de uma execução de 2 s,
+    Cascade; vista do lado de Alice, valores variam entre execuções)
+---------------------------------------------------------------------------
+  [POS-ALICE] [PE] amostra=1216 bits, erros=30, QBER=2.47% (limite superior 13.13%, mu=0.1066); restam 4865 bits.
+  [POS-ALICE] [EC-cascade] 4865 -> 4865 bits | vazados=1006 | eficiência f=1.197 | rodadas=60 | verificação OK
+  [POS-ALICE] [PA] n=4865, e_fase<=13.13%, vazado=1006 -> chave final = 1069 bits (eps_sec=1e-09)
+  [POS-ALICE] [AUTH] 128 mensagens / 25281 bytes autenticados: OK (consumiu 381 bits de chave; restam 7811)
+  [POS-ALICE] [AUTH] 381 bits da chave final devolvidos ao reservatório de autenticação.
+
+Em seguida ALICE.py/BOB.py imprimem o bloco "=== RESULTADOS FINAIS ===" (seção 11).
+(Nesse log, "128 mensagens" vem de um teste com link em memória; numa execução
+real o número difere porque inclui a troca de sifting e depende do QBER.)
+
+
+================================================================================
+5. FLUXO COMPLETO DA SESSÃO (PASSO A PASSO)
+================================================================================
+
+5.1 Linha do tempo
+------------------
+        ALICE (servidor)                                  BOB (cliente)
+        ----------------                                  -------------
+  F0    instala hardware simulado (seed)                  instala hardware simulado (seed)
+        imprime o IP local
+        abre o servidor TCP e espera (accept) <---------- conecta (tenta por até 30 s)
+
+  F1    cria BBM92HardwareManager('Alice')                cria BBM92HardwareManager('Bob')
+        calibrate_delays(...)                             calibrate_delays(...)
+        capture_stream(CAPTURE_S)                         capture_stream(CAPTURE_S)
+        process_time_tags -> bits brutos,                 process_time_tags -> bits brutos,
+        timestamps e bases locais                         timestamps e bases locais
+
+  F2    SIFTING: troca {"ts":[...], "bases":[...]} ------ (mensagem de Bob)
+        perform_sifting(is_bob=False)                     perform_sifting(is_bob=True)
+        (se 0 coincidências: aborta com erro)             (se 0 coincidências: aborta com erro)
+
+  F3    ClassicalLink(role, channel) + link.record(...)   (idem) -> sifting entra na transcrição
+        AuthKeyPool.load(AUTH_KEY_FILE)                   (idem)
+        run_postprocessing:
+          a) parameter_estimation  (amostra 20% -> QBER, limite de Serfling)
+          b) error_correction      (Cascade ou LDPC) + verificação por hash
+          c) privacy_amp           (hash de Toeplitz -> chave final)
+          d) authentication        (tag Wegman-Carter sobre TODA a transcrição)
+          e) reposição de 381 bits no reservatório (se a chave final > 381 bits)
+
+  F4    imprime "RESULTADOS FINAIS"                       imprime "RESULTADOS FINAIS"
+        fecha o socket (saída do bloco `with`)            fecha o socket
+
+5.2 Princípio do "lockstep"
+---------------------------
+Há UMA única conexão TCP, aberta em F0 e usada até F4 por todas as fases.
+Alice e Bob executam o mesmo roteiro; a k-ésima operação de rede de um lado
+casa com a k-ésima do outro. Por isso:
+
+  * os dois nós precisam usar o MESMO EC_METHOD, o MESMO CAPTURE_S e os mesmos
+    parâmetros de `run_postprocessing`;
+  * qualquer divergência de roteiro faz mensagens ficarem defasadas ou o
+    programa travar esperando (não há timeout de leitura no canal);
+  * `PostProcessingAbort` e `AuthenticationError` são levantadas de forma
+    consistente nos dois nós, e nesse caso NENHUMA chave deve ser usada.
+
+5.3 Primitivas de comunicação
+-----------------------------
+O canal só oferece `exchange(msg)`: Alice ENVIA e depois RECEBE; Bob RECEBE e
+depois ENVIA (isso evita deadlock). O `ClassicalLink` constrói tudo sobre isso:
+
+  link.exchange(msg)  troca simétrica; devolve a mensagem do outro nó.
+  link.send(obj)      "este nó fala": exchange(json.dumps(obj)); o outro nó
+                      chama recv() e a resposta dele (string vazia) é ignorada.
+  link.recv()         "este nó escuta": exchange("") e json.loads do que veio.
+
+Logo, cada mensagem lógica "unidirecional" custa uma troca de duas mensagens
+TCP (uma delas vazia). Isso é simples e robusto; o preço é uma ida-e-volta
+por mensagem lógica (por isso o Cascade foi implementado em lote, seção 9.4).
+
+
+================================================================================
+6. REFERÊNCIA: SIMLINK.py  (HARDWARE SIMULADO)
+================================================================================
+
+6.1 Mecanismo de substituição do driver
+---------------------------------------
+BBM92.py usa o driver real apenas por quatro chamadas:
+
+     TT.createTimeTagger()          -> SimulatedTimeTagger
+     tagger.setInputDelay(ch, ps)
+     tagger.sync()
+     TT.TimeTagStream(tagger, buffer_size, channels)
+          .start() / .stop() / .getEvents()  (+ getTimestamps()/getChannels())
+
+`install_simulated_hardware()` cria os módulos "Swabian" e "Swabian.TimeTagger"
+e os registra em `sys.modules`. Assim `import Swabian.TimeTagger as TT` em
+BBM92.py resolve para o backend simulado, sem alterar o código do BBM92.
+
+Ordem de instalação em ALICE.py/BOB.py (detalhe sutil, mas correto):
+  1. `from BBM92 import ...` executa as linhas iniciais de BBM92.py, que
+     instalam o hardware simulado SEM semente (`pair_rate_hz=3e6`).
+  2. Depois, o código de nível de módulo de ALICE.py/BOB.py chama
+     `install_simulated_hardware(..., seed=42)`, que recria o enlace padrão
+     (`_DEFAULT_LINK`) COM semente.
+  3. `createTimeTagger()` lê `_DEFAULT_LINK` no momento da chamada (dentro de
+     `BBM92HardwareManager.__init__`, que roda depois), portanto vale o enlace
+     com seed=42 mesmo que BBM92 tenha guardado o módulo `TT` da 1ª instalação.
+
+6.2 Reprodutibilidade entre processos (Alice e Bob em máquinas diferentes)
+--------------------------------------------------------------------------
+Não há estado compartilhado entre as máquinas. Para que os dois enxerguem os
+MESMOS pares emaranhados, o SIMLINK faz duas coisas:
+
+  (a) mesma semente (seed=42) -> mesma sequência pseudoaleatória nos dois;
+  (b) mesma duração de captura. O tempo real medido nunca é idêntico entre
+      máquinas, e uma diferença mínima mudaria `poisson(taxa*duração)` e
+      divergiria toda a sequência. Por isso o SIMLINK substitui `time.sleep`
+      por `_recording_sleep`, que grava o valor literal pedido (CAPTURE_S) e
+      ainda dorme de verdade. `TimeTagStream.stop()` usa esse valor literal,
+      não o tempo medido. (Funciona porque `time` é singleton em sys.modules:
+      trocar `_walltime.sleep` troca também o `time.sleep` que BBM92.py chama.)
+
+Cada processo gera o lote completo (8 canais) e filtra apenas os canais do
+próprio nó (`channels=` do stream). Consequências práticas:
+  * CAPTURE_S, seed, pair_rate e demais parâmetros devem ser IGUAIS nos dois nós;
+  * a mesma versão do NumPy deve ser usada (seção 3.4);
+  * duas capturas seguidas no mesmo processo dão amostras diferentes (o
+    gerador avança), e isso também vale para o outro nó; a correspondência é
+    mantida se ambos fizerem o mesmo número de capturas.
+
+6.3 Modelo físico (SimulatedEntangledLink.generate)
+---------------------------------------------------
+Para uma janela de `duration_s` segundos:
+
+  1. Pares: n_pairs ~ Poisson(pair_rate_hz * duration_s); instantes de criação
+     uniformes em [0, janela], ordenados.
+  2. Bases: Alice e Bob escolhem Z ou X com probabilidade 50/50, de forma
+     independente (escolha passiva, como num PAM).
+  3. Bit de Alice: aleatório.
+  4. Bit de Bob (singleto |Psi->):
+       - bases iguais: bit = 1 - bit_Alice, com probabilidade de erro
+         `intrinsic_qber` (então bit = bit_Alice);
+       - bases diferentes: bit aleatório e descorrelacionado.
+  4b. Espiã (opcional, intercept-resend): Eve mede na própria base aleatória e
+      reenvia a Bob um fóton preparado (não emaranhado), de modo que, nos
+      eventos de bases iguais, ~50% dos casos têm Eve em base errada e Bob
+      acaba com 50% de erro nesses: QBER ~ 25% (+ intrínseca).
+  5. Canais: (base, bit) -> canal físico (1..4 Alice; 5..8 Bob).
+  6. Eficiência: cada lado "enxerga" o fóton com probabilidade eta_alice /
+     eta_bob, independentemente.
+  7. Timestamps: base de época (20.000 ps) + instante de criação + desvio de
+     cabeamento do canal (_OFFSET_PS) + jitter gaussiano do SPAD.
+  8. Contagens escuras: processo de Poisson independente em cada um dos 8
+     canais (taxa total dividida por 4 por nó), com o mesmo desvio de canal.
+  Por fim, tudo é ordenado por tempo e arredondado para inteiros (ps).
+
+6.4 Parâmetros de SimulatedEntangledLink
+----------------------------------------
+  Parâmetro                  Padrão da classe   Uso em ALICE/BOB   Significado
+  -------------------------  -----------------  -----------------  --------------------------
+  pair_rate_hz               2.0e6              3e6                pares gerados por segundo
+  eta_alice                  0.05               (padrão)           eficiência total de detecção
+  eta_bob                    0.04               (padrão)           idem, lado de Bob
+  dark_counts_alice_cps      1742.0             (padrão)           dark counts (soma dos 4 SPADs)
+  dark_counts_bob_cps        776.0              (padrão)           idem, lado de Bob
+  detector_jitter_fwhm_ps    350.0              (padrão)           jitter FWHM (sigma = FWHM/2,3548
+                                                                   ~ 148,6 ps)
+  intrinsic_qber             0.02               (padrão)           erro residual sem espiã
+  eve_intercept_resend       False              False              liga o ataque intercept-resend
+  seed                       None               42                 semente do gerador
+
+Valores de referência do cabeçalho do arquivo (dissertação de A. Krzic):
+SPADs com ~350 ps FWHM e eficiência quântica > 60% a 810 nm; dark counts
+medidos 1742 cps (Alice) e 776 cps (Bob); janela de coincidência de 800 ps;
+QBER típica < 2% (noite) a < 3,4% (dia).
+
+Taxas esperadas com pair_rate_hz = 3e6 e eficiências padrão:
+  * eventos por canal do nó: ~150 mil/s em Alice e ~120 mil/s em Bob
+    (medido em 1 s: 151.913 e 120.583 eventos);
+  * coincidências verdadeiras: 3e6 x 0,05 x 0,04 = ~6.000/s (estimativa);
+  * bits peneirados (metade das coincidências, bases iguais): ~3.000/s
+    (medido: 3.108 bits em 1 s);
+  * coincidências acidentais: ~30/s (estimativa); com a QBER intrínseca de 2%
+    isso dá QBER total ~2,2-2,7% (medida na chave peneirada: 1,7% a 2,7%
+    conforme a duração, por flutuação estatística).
+
+6.5 Desvios de cabeamento e calibração
+--------------------------------------
+Desvios "verdadeiros" embutidos no simulador (`_OFFSET_PS`, em ps):
+
+     Alice:  canal 1: 0     2: +50     3: 0      4: +50
+     Bob:    canal 5: -12500  6: -12550  7: -12500  8: -12550
+
+`setInputDelay(ch, delay_ps)` SOMA `delay_ps` aos timestamps do canal quando
+os eventos são lidos (`getEvents`). Em Bob, calibrar com +12500/+12550 cancela
+o desvio de ~12,5 ns (sem isso quase não haveria coincidências dentro da janela
+de 800 ps). Em Alice os desvios são pequenos (50 ps) e irrelevantes frente à
+janela (ver observação 16.4). Sem calibrar os canais X de Bob (7 e 8), o sifting
+perderia praticamente toda a base X.
+
+6.6 Espiã (intercept-resend)
+----------------------------
+Com `eve_intercept_resend=True` (em AMBOS os nós), a QBER na chave peneirada
+sobe para ~25% (medido: ~26,8% na peneirada e 29,3% na amostra de PE numa
+execução de 1 s). Como o limite do pós-processamento é 11%, a sessão é abortada
+em `parameter_estimation` com `PostProcessingAbort` nos dois nós.
+
+6.7 API do módulo
+-----------------
+  SimulatedEntangledLink(...)         modelo físico; .generate(duration_s) devolve
+                                      (timestamps int64 em ps, channels int64),
+                                      ordenados.
+  configure_link(**kwargs)            recria o enlace padrão `_DEFAULT_LINK`.
+  _SimulatedEvents                    espelha o objeto de getEvents():
+                                      getTimestamps(), getChannels().
+  SimulatedTimeTagger                 setInputDelay(ch, ps), sync() (no-op),
+                                      get_input_delays().
+  SimulatedTimeTagStream              start(), stop(), getEvents(). stop() sem
+                                      start() levanta RuntimeError; getEvents()
+                                      antes de stop() também.
+  createTimeTagger(serial=None)       fábrica do tagger simulado.
+  install_simulated_hardware(**kw)    registra "Swabian.TimeTagger" em sys.modules
+                                      (e reconfigura o enlace se houver kwargs).
+  run_bbm92(path, **kw)               instala o simulador e executa BBM92.py via
+                                      runpy como __main__.
+
+Comportamento de `getEvents()`: gera o lote; mantém só os canais do stream;
+soma os atrasos configurados; trunca em `buffer_size` eventos (padrão 10
+milhões, algo como ~65 s de captura nos valores padrão, truncamento silencioso);
+reordena por tempo.
+
+6.8 Linha de comando
+--------------------
+    python SIMLINK.py [--bbm92 CAMINHO] [--pair-rate 2e6] [--eta-alice 0.05]
+                      [--eta-bob 0.04] [--dark-alice 1742] [--dark-bob 776]
+                      [--jitter-fwhm 350] [--intrinsic-qber 0.02] [--eve]
+                      [--seed N]
+
+Instala o simulador e executa o BBM92.py indicado. Na versão fornecida, o
+BBM92.py só define classes (não tem bloco `__main__`), então esse comando
+não produz saída útil (ver observação 16.5). O uso real é por ALICE.py/BOB.py.
+
+
+================================================================================
+7. REFERÊNCIA: BBM92.py  (AQUISIÇÃO E SIFTING)
+================================================================================
+
+As duas primeiras linhas do arquivo (`import SIMLINK` e
+`SIMLINK.install_simulated_hardware(...)`) fixam o uso do hardware simulado
+(ver seção 17 para removê-las). Depois vem `import Swabian.TimeTagger as TT`.
+
+7.1 class BBM92HardwareManager
+------------------------------
+  __init__(node_type, serial_number=None)
+      Cria o time tagger (`TT.createTimeTagger(serial_number)` se houver número
+      de série; senão `TT.createTimeTagger()`) e define os canais do nó:
+        'ALICE' -> {'H':1, 'V':2, 'D':3, 'A':4}
+        'BOB'   -> {'H':5, 'V':6, 'D':7, 'A':8}
+      `node_type` não distingue maiúsculas/minúsculas; outro valor levanta
+      ValueError("O nó deve ser 'Alice' ou 'Bob'").
+
+  calibrate_delays(delays_ps: dict)
+      Para cada (canal, atraso em ps) chama `tagger.setInputDelay`. Serve para
+      compensar diferenças de comprimento de fibra/cabo. Exemplos usados:
+        Alice: {1: 0, 2: 50, 3: 0, 4: 50}
+        Bob:   {5: 12500, 6: 12550, 7: 12500, 8: 12550}
+
+  capture_stream(duration_s) -> (timestamps, channels)
+      Cria um `TimeTagStream` (buffer de 10.000.000 eventos, só os 4 canais do
+      nó), chama start(), `tagger.sync()`, dorme `duration_s`, chama stop(),
+      lê os eventos e devolve (timestamps em ps, canais). A duração é a de
+      relógio de parede (time.sleep); a captura de CAPTURE_S segundos leva
+      CAPTURE_S segundos reais.
+
+7.2 class BBM92ProtocolEngine
+-----------------------------
+  __init__(coincidence_window_ps=1000)
+      Guarda a janela de coincidência (ALICE.py e BOB.py usam 800 ps),
+      o `channel_map` {canal: (base, bit)} e os atributos `valid_ts`
+      e `bases` (preenchidos por process_time_tags).
+
+  process_time_tags(timestamps, channels) -> (key, n)
+      Percorre os eventos; para cada canal conhecido registra:
+        key[i]      = bit do canal (0 ou 1)
+        bases[i]    = 'Z' ou 'X'
+        valid_ts[i] = timestamp
+      Ainda não há peneiramento: são TODAS as detecções do nó (incluindo
+      fótons sem par e dark counts). Retorna o vetor de bits e seu tamanho.
+      Também guarda `valid_ts` e `bases` em `self`.
+
+  perform_sifting(local_key, remote_ts, remote_bases, is_bob=False)
+      Alinha no tempo os eventos locais e remotos com uma varredura de dois
+      ponteiros (i local, j remoto), em O(n_local + n_remote):
+        - se |ts_local[i] - ts_remoto[j]| <= janela: é uma coincidência;
+            * se as bases forem iguais, o bit local entra na chave peneirada
+              (em Bob, INVERTIDO: 1 - bit, por causa da anticorrelação do
+              singleto);
+            * i e j avançam juntos (casamento 1-para-1, guloso);
+        - caso contrário avança o ponteiro do evento mais antigo.
+      Retorna (chave peneirada como np.array, comprimento). Os bits nunca
+      trafegam pela rede, apenas timestamps e bases. A varredura é simétrica,
+      então Alice e Bob obtêm chaves peneiradas de MESMO comprimento e
+      ordenadas de forma idêntica.
+
+  calculate_qber(qber_bits_a, qber_bits_b)
+      Compara dois vetores e devolve a fração de bits diferentes. NÃO é usado
+      pelo fluxo atual (a QBER é estimada em POSTPROCESS.parameter_estimation);
+      permanece como utilitário.
+
+7.3 Observações de física/engenharia
+------------------------------------
+  * Suposição: os timestamps de Alice e Bob estão numa base de tempo comum
+    (no hardware real, relógio de Rb compartilhado/sincronização; no
+    simulador, a base é comum por construção).
+  * Janela de 800 ps vs. jitter: a diferença entre dois jitters gaussianos
+    independentes (sigma ~148,6 ps cada) tem sigma ~210 ps; a janela de
+    +-800 ps cobre ~3,8 sigma, ou seja, ~99,99% dos pares verdadeiros
+    (estimativa).
+  * Coincidências acidentais (fótons de pares diferentes, dark counts) entram
+    no sifting como eventos com 50% de erro; elas elevam a QBER observada.
+
+
+================================================================================
+8. REFERÊNCIA: CLASSIC_CHANNEL.py  (CANAL TCP PERSISTENTE)
+================================================================================
+
+8.1 Enquadramento de mensagens
+------------------------------
+Cada mensagem é uma string UTF-8 precedida por um cabeçalho de 8 bytes
+(`struct.Struct("!Q")`, inteiro sem sinal, big-endian) com o tamanho do corpo:
+
+      +----------------------+------------------------------+
+      | tamanho (8 bytes, !Q)| corpo (UTF-8, tamanho bytes) |
+      +----------------------+------------------------------+
+
+  _send_message(sock, message)   codifica e envia cabeçalho + corpo (sendall).
+  _receive_exact(sock, n)        lê EXATAMENTE n bytes, repetindo recv() (em
+                                 pedaços de até 65.536 bytes); levanta
+                                 ConnectionError se o outro lado fechar antes.
+  _receive_message(sock)         lê o cabeçalho e depois o corpo.
+
+Isso permite mensagens de qualquer tamanho (por exemplo, os vetores de
+timestamps do sifting, que passam de megabytes) sem depender de um tamanho
+máximo de buffer.
+
+8.2 class AliceClassicalChannel  (servidor)
+-------------------------------------------
+  __init__(host='0.0.0.0', port=65432)
+  connect()    cria o socket, SO_REUSEADDR, bind, listen e `accept()` (BLOQUEANTE,
+               sem timeout) para UMA conexão de Bob. Imprime a porta e o
+               endereço do cliente.
+  exchange(msg) -> str
+               envia `msg` e DEPOIS espera a mensagem de Bob; devolve a de Bob.
+               Imprime "[Alice] Mensagem enviada via canal clássico.".
+  close()      fecha a conexão e o socket de escuta.
+  Suporta `with` (connect na entrada, close na saída).
+
+8.3 class BobClassicalChannel  (cliente)
+----------------------------------------
+  __init__(host, port=65432, connect_timeout_s=30.0, retry_interval_s=0.5)
+               exige `host` real: vazio, "127.0.0.1", "localhost" ou "::1"
+               levantam ValueError.
+  connect()    tenta conectar em laço (a cada `retry_interval_s`) até
+               `connect_timeout_s`; ao esgotar, levanta ConnectionError com o
+               último erro. Isso permite iniciar Bob antes de Alice estar pronta.
+  exchange(msg) -> str
+               PRIMEIRO recebe a mensagem de Alice, DEPOIS envia `msg`;
+               devolve a mensagem de Alice.
+  close()      fecha o socket. Suporta `with`.
+
+8.4 Semântica de exchange
+-------------------------
+Nos dois lados `exchange(msg)` devolve a mensagem do OUTRO nó. A ordem
+(Alice envia -> Bob recebe; Bob envia -> Alice recebe) evita que os dois
+fiquem bloqueados enviando ao mesmo tempo. A conexão é ÚNICA e persistente:
+sifting e todo o pós-processamento usam o mesmo socket.
+
+8.5 Notas
+---------
+  * O canal não criptografa nem autentica por si só; a integridade/
+    autenticidade das mensagens é garantida a posteriori pela tag
+    Wegman-Carter (seção 13.4). Confidencialidade do canal clássico não é
+    necessária em QKD: tudo o que trafega é considerado público.
+  * O canal não define timeouts de leitura: se um dos nós morrer ou o roteiro
+    divergir, o outro pode ficar esperando indefinidamente.
+  * `ClassicalLink` ativa TCP_NODELAY no socket (o canal envia cada mensagem
+    em dois `sendall`; com o algoritmo de Nagle, o 2º pacote poderia esperar
+    ~40 ms pelo ACK atrasado do 1º, o que dominaria o tempo do Cascade).
+
+
+================================================================================
+9. REFERÊNCIA: AUXILIARY.py  (PRIMITIVAS DO PÓS-PROCESSAMENTO)
+================================================================================
+
+Módulo de uso restrito ao POSTPROCESS.py. Convenções:
+  * Chaves = np.ndarray uint8 (0/1).
+  * Alice é a REFERÊNCIA: a chave dela nunca muda na correção de erros; Bob
+    corrige a dele (reconciliação direta, não "reverse reconciliation").
+  * Aleatoriedade imprevisível (amostra de PE, sementes de hash, bits punçados,
+    sementes do Cascade) usa o módulo `secrets` (CSPRNG do sistema).
+    Aleatoriedade PÚBLICA e reprodutível (permutações do Cascade, matriz H do
+    LDPC) usa `np.random.RandomState`, cujo fluxo o NumPy mantém congelado
+    entre versões (o `Generator` novo não garante isso).
+
+9.1 Exceções e utilitários
+--------------------------
+  PostProcessingError        base de todos os erros do pós-processamento.
+  PostProcessingAbort        abortar o protocolo (QBER alta, verificação falhou,
+                             chave curta, LDPC impossível...).
+  AuthenticationError        a tag da transcrição não confere: descartar a chave.
+  AuthKeyExhausted           chave de autenticação insuficiente.
+  (As três últimas herdam de PostProcessingError; ALICE.py/BOB.py capturam essa
+  classe base.)
+
+  binary_entropy(x)          h2(x), com x limitado a [1e-12, 1-1e-12].
+  as_bits(key)               cópia como uint8 achatado.
+  random_bits(n)             n bits do CSPRNG (secrets.token_bytes).
+  pack_bits / unpack_bits    vetor de bits <-> string hexadecimal (8x mais
+                             compacto que JSON de lista de inteiros).
+  bits_to_int(bits)          bits -> inteiro (big-endian).
+  log(role, msg, verbose)    imprime "[POS-<ROLE>] msg".
+
+9.2 ClassicalLink
+-----------------
+Adaptador entre o POSTPROCESS e o canal persistente.
+
+  ClassicalLink(role, channel=None, exchange_fn=None, quiet=True)
+    role         'alice' ou 'bob'.
+    channel      AliceClassicalChannel (role='alice') ou BobClassicalChannel
+                 (role='bob'), JÁ CONECTADO; o tipo é validado (ValueError se
+                 não combinar).
+    exchange_fn  função msg -> msg_remota que substitui o canal (testes).
+    quiet        suprime o print do canal a cada troca (redireciona stdout).
+  Atributos: role, channel, transcript (lista de (msg_alice, msg_bob)),
+             n_exchanges, bytes_total.
+  Métodos:
+    exchange(msg)   troca simétrica; registra na transcrição.
+    send(obj)       exchange(json.dumps(obj)); o par chama recv().
+    recv()          json.loads(exchange("")).
+    record(alice_msg, bob_msg)
+                    registra uma troca feita FORA do link (usado para o
+                    sifting). A ordem deve ser a mesma nos dois nós: primeiro
+                    a mensagem de Alice, depois a de Bob.
+    transcript_bytes()
+                    serialização da transcrição para autenticação. Para cada
+                    troca i: índice (8 bytes) + len(msg_alice) (8) + msg_alice
+                    + len(msg_bob) (8) + msg_bob (tudo big-endian/UTF-8).
+                    A codificação é injetiva: reordenar, inserir, remover ou
+                    alterar mensagens muda os bytes.
+  O link NÃO abre nem fecha a conexão: quem a possui é o `with` de
+  ALICE.py/BOB.py. Crie o link DEPOIS de o canal estar conectado.
+
+  make_local_link_pair()
+    Devolve (link_alice, link_bob) ligados por filas em memória, para testes
+    com duas threads no mesmo processo, sem rede (exemplo na seção 14.6).
+
+9.3 Estimação de parâmetros: limite de Serfling
+-----------------------------------------------
+  serfling_mu(n_rest, k_sample, eps) -> mu
+      Menor mu tal que Pr[ e_resto >= e_amostra + mu ] <= eps:
+
+          mu = sqrt( N (k+1) ln(1/eps) / (2 n k^2) ),   N = n + k
+
+      n = bits restantes, k = bits da amostra. Devolve 1.0 se n<=0 ou k<=0.
+      Com os valores padrão (amostra de 20%, eps_pe = 2,5e-10) resulta em
+      aproximadamente mu = sqrt(69/N_peneirada) (estimativa que confere com os
+      logs: N=6081 -> mu=0,1066; N=14939 -> mu=0,0680).
+      Essa é a parte que torna chaves curtas inúteis: mu domina a QBER.
+
+9.4 Cascade
+-----------
+  cascade_block_sizes(n, qber, n_passes, k1=None)
+      Tamanho de bloco por passagem: k1 = ceil(0,73/QBER) (QBER mínima 1e-4),
+      k_i = 2 k_(i-1). Cada tamanho é limitado a n na passagem 1 e a ceil(n/2)
+      nas passagens seguintes (passagens extras com blocos ~n/2 reduzem a
+      taxa de erro de quadro de forma ~exponencial, Martinez-Mateo et al. 2015).
+
+  Layout (_cascade_layout): a passagem 1 usa a ordem original; as demais usam
+  permutações públicas geradas por RandomState(seed). A `seed` é sorteada por
+  Alice (secrets.randbits(31)) e enviada a Bob.
+
+  cascade_alice(key, link, qber, n_passes=4, k1=None, seed=None)
+      1) calcula as paridades de TODOS os blocos de TODAS as passagens e as
+         envia numa única mensagem {"seed","sizes","par"};
+      2) fica servindo pedidos de Bob: para cada (passagem q, intervalo [a,b))
+         responde a paridade de perm_q[a:b] (via somas de prefixo);
+      3) termina quando Bob manda {"done": true}.
+      Nunca altera a própria chave.
+
+  cascade_bob(key, link)
+      Variante "em lote" do Cascade: em cada rodada, TODAS as buscas binárias
+      (uma por bloco de paridade ímpar) andam em paralelo, reduzindo o número
+      de idas-e-voltas de (#erros x log2 k) para ~log2 k por rodada de cascata.
+        - Bob compara as paridades de bloco recebidas com as dele e detecta
+          sozinho, sem tráfego, quais blocos estão ímpares;
+        - BINARY em paralelo: pede a Alice a paridade da metade esquerda de
+          cada intervalo ativo e estreita o intervalo até 1 bit;
+        - inverte os bits localizados e atualiza as paridades dos blocos que
+          os contêm em TODAS as passagens (efeito cascata); repete até não
+          restar bloco ímpar em nenhuma passagem <= p.
+      A quantidade de informação revelada é a mesma do Cascade sequencial.
+  Ambas devolvem dict: key, leaked (paridades reveladas), rounds
+  (idas-e-voltas da busca binária), n_corrected (só Bob), sizes.
+
+9.5 LDPC rate-adaptive por síndrome
+-----------------------------------
+Constantes:
+  LDPC_EFF_LADDER = (1.20, 1.25, 1.30, 1.36, 1.45)   escada de eficiências
+  LDPC_VAR_DEGREES = {3: 0.80, 15: 0.20}             80% dos nós de variável
+                                                     com grau 3, 20% com grau 15
+  LDPC_BIG_LLR = 25.0                                confiança de bits revelados
+
+  build_ldpc(n, m, seed, degrees=None, n_tail=0) -> (var_idx, chk_idx)
+      Matriz H (m x n) esparsa, irregular, pseudoaleatória (modelo de
+      configuração), determinística em `seed`; arestas duplicadas são
+      removidas. Os `n_tail` últimos nós (bits punçados) recebem os MAIORES
+      graus. Alice e Bob reconstroem H a partir de (n, m, seed); a matriz
+      nunca trafega.
+  ldpc_syndrome(var_idx, chk_idx, m, x)   síndrome H x (mod 2).
+  bp_decode(var_idx, chk_idx, n, m, llr_ch, syndrome, max_iter=100)
+      Propagação de crenças soma-produto no domínio tanh, vetorizada, para
+      decodificação POR SÍNDROME (acha c com H c = síndrome). LLR > 0 significa
+      bit 0. Devolve (bits, convergiu).
+  _split_frames(N, frame_size)   divide em F = ceil(N/frame_size) quadros de
+                                 tamanhos quase iguais.
+  _ldpc_schedule(n_k, q, ladder) calcula, para o quadro de n_k bits:
+                                 vazamentos L_a = round(f_a x n_k x h2(q));
+                                 m = L_ultimo; p_a = m - L_a; d = p_0.
+
+  ldpc_alice(key, link, qber, frame_size=8192, ladder, seed=None)
+      q_eff = QBER limitada a [0,005; 0,5]. Para cada quadro: anexa d bits
+      ALEATÓRIOS "punçados" (secretos), constrói H, calcula a síndrome e envia
+      {"frames": [...], "q": q_eff}. Depois, a cada tentativa a, recebe de Bob a
+      lista de quadros que falharam; revela os bits punçados do intervalo
+      [p_(a+1), p_a) desses quadros (eles passam a ser "encurtados") e repete.
+      Quadros que falham na última eficiência são DESCARTADOS (nos dois nós).
+      Vazamento de um quadro = m - p_(tentativa em que convergiu).
+  ldpc_bob(key, link, ladder, max_iter=100)
+      Monta LLRs: L0 = ln((1-q)/q) com sinal do bit de Bob nos n_k bits
+      conhecidos, 0 nos punçados. Decodifica por BP; envia {"failed": [...]};
+      aplica os bits revelados com LLR = +-25 e tenta de novo.
+  Devolvem dict: key (só quadros mantidos), leaked, rounds, dropped_frames,
+  n_frames. Se m >= n (QBER alta demais) Alice levanta PostProcessingAbort.
+
+9.6 Hash de Toeplitz, verificação e comprimento da chave final
+--------------------------------------------------------------
+  toeplitz_hash(seed_bits, x, m) -> y
+      y = T x (mod 2), T de dimensão m x n com T[i,j] = seed[i - j + n - 1]
+      (semente de n + m - 1 bits). Uma matriz de Toeplitz aleatória forma uma
+      família 2-universal. Implementação vetorizada que MATERIALIZA a matriz
+      m x n (ver consumo de memória na seção 14.4).
+
+  verify_alice(key, link, eps_cor) / verify_bob(key, link)
+      Confirmam que as chaves ficaram idênticas: Alice envia m =
+      ceil(log2(1/eps_cor)) (34 bits com eps_cor = 1e-10), a semente do hash e
+      a saída; Bob compara e responde {"ok": bool}. Vazam m bits.
+
+  secret_key_length(n, e_phase, leaked_bits, eps_pa) -> l
+      l = floor( n (1 - h2(e_phase)) - leaked_bits + 2 - 2 log2(1/eps_pa) ),
+      com mínimo 0 (Lema do Leftover Hash). Ver seção 13.
+
+9.7 Autenticação Wegman-Carter
+------------------------------
+Constantes: _P127 = 2^127 - 1 (primo de Mersenne), _TAG_BITS = 127,
+AUTH_BITS_PER_SESSION = 381 (r + OTP de Alice + OTP de Bob, 127 bits cada).
+
+  _poly_hash(data, r)   hash polinomial em GF(2^127 - 1) (Horner). O
+                        comprimento é prefixado (8 bytes) e dados são
+                        divididos em blocos de 14 bytes + byte marcador 0x01
+                        (bloco < 2^120 < p), o que torna a codificação
+                        injetiva. Família epsilon-quase-universal, eps <= L/p
+                        (L = nº de blocos).
+  wc_tag(data, r_bits, otp_bits)
+                        r = int(r_bits) mod (p-1) + 1 (nunca 0); tag =
+                        PolyHash_r(data) XOR OTP, formatada em 32 dígitos hex.
+
+  class AuthKeyPool(bits, path=None)
+      Reservatório de chave secreta pré-compartilhada; cada bit é usado UMA vez
+      e a posição consumida é gravada em disco a cada `take`.
+        AuthKeyPool.generate(n_bits, path=None)  novo reservatório aleatório
+        AuthKeyPool.load(path)                   lê o JSON (FileNotFoundError se
+                                                 o arquivo não existir)
+        save(path=None)                          gravação atômica
+        remaining()                              bits ainda disponíveis
+        take(n)                                  consome n bits (levanta
+                                                 AuthKeyExhausted se faltar)
+        add(bits)                                descarta os já consumidos,
+                                                 anexa os novos e zera `pos`
+
+9.8 Dataclasses de resultado
+----------------------------
+  PEResult           key (sem a amostra), qber, qber_upper, mu, n_sample,
+                     n_errors, n_remaining
+  ECResult           key, leaked_bits (paridades/síndromes + hash de
+                     verificação), method, n_in, n_out, efficiency, rounds,
+                     verified, info (dict com detalhes do algoritmo)
+  PAResult           key, n_in, n_out, qber_upper, leaked_bits
+  AuthResult         verified, key_bits_consumed, n_messages, transcript_bytes
+  PostProcessResult  final_key, qber, qber_upper, authenticated, pe, ec, pa,
+                     auth, replenished_bits
+
+9.9 Linha de comando
+--------------------
+    python AUXILIARY.py --gen-auth-key <arquivo.json> <n_bits>
+Gera o reservatório de autenticação. Sem argumentos, imprime a docstring.
+
+
+================================================================================
+10. REFERÊNCIA: POSTPROCESS.py  (PE -> EC -> PA -> AUTH)
+================================================================================
+
+API de alto nível, independente de nó. Alice e Bob chamam as mesmas funções, na
+mesma ordem, com os mesmos parâmetros; o papel vem de `link.role`.
+
+    chave peneirada
+      -> parameter_estimation      amostra aleatória -> QBER + limite de Serfling
+      -> error_correction          Cascade (padrão) ou LDPC + verificação
+      -> privacy_amp               hash de Toeplitz (Leftover Hash Lemma)
+      -> authentication            tag Wegman-Carter sobre toda a transcrição
+      -> chave final aceita (ou exceção -> descartar)
+
+Constante: `_DEFAULT_QBER_MAX = 0.11` (limiar usual do BB84/BBM92, ~11%).
+
+10.1 parameter_estimation
+-------------------------
+  parameter_estimation(key, link, sample_fraction=0.20, qber_threshold=0.11,
+                       eps_pe=2.5e-10, verbose=True) -> PEResult
+
+  Alice sorteia k = round(N x sample_fraction) posições SEM reposição (requisito
+  do teorema de Serfling), envia {n, idx, bits}; Bob conta os erros e devolve
+  {errors}. A amostra é DESCARTADA da chave (bits revelados deixam de ser
+  secretos). Os dois calculam:
+
+      qber       = erros / k                     (e_k, taxa na amostra)
+      mu         = serfling_mu(N-k, k, eps_pe)
+      qber_upper = min(0,5; qber + mu)           (limite superior para o resto)
+
+  Condições de aborto (PostProcessingAbort, nos dois nós):
+    * chave peneirada pequena demais (k < 1 ou N-k < 1);
+    * comprimentos diferentes entre Alice e Bob;
+    * qber (da AMOSTRA, não qber_upper) > qber_threshold.
+
+  Devolve PEResult com a chave restante (sem a amostra).
+
+10.2 Correção de erros
+----------------------
+  error_correction_cascade(key, qber, link, n_passes=4, k1=None,
+                           eps_cor=1e-10, seed=None, verbose=True) -> ECResult
+  error_correction_LDPC(key, qber, link, frame_size=8192, ladder=LDPC_EFF_LADDER,
+                        max_iter=100, eps_cor=1e-10, seed=None, verbose=True)
+  error_correction(key, qber, link, method="cascade", **kwargs)
+      despachador; ValueError se `method` não for 'cascade' nem 'ldpc'.
+
+  Todas terminam em `_finish_ec`, que:
+    1) se a chave de saída não é vazia, roda a VERIFICAÇÃO por hash 2-universal
+       (verify_alice/verify_bob); se falhar, PostProcessingAbort;
+    2) soma ao vazamento os bits do hash (34 com eps_cor=1e-10);
+    3) calcula a eficiência f = vazamento_EC / (n_in x h2(qber)), onde 1,0 é o
+       limite de Shannon. NÃO inclui os bits de verificação; é NaN (impresso
+       "nan") se a QBER da amostra for 0;
+    4) devolve ECResult com leaked_bits = vazamento_EC + bits de verificação.
+       Esse valor é o que a privacy_amp subtrai.
+
+  Escolha do método (ver também 14.3):
+    * Cascade: poucas premissas, funciona bem com chaves curtas e médias;
+      muitas idas-e-voltas na rede (dezenas a centenas de mensagens).
+    * LDPC: poucas rodadas e eficiência estável, mas precisa de quadros
+      razoavelmente grandes; em quadros curtos pode descartá-los (chave menor
+      ou vazia).
+
+10.3 privacy_amp
+----------------
+  privacy_amp(key, link, qber_upper, leaked_bits, eps_sec=1e-9, verbose=True)
+      -> PAResult
+
+  l = secret_key_length(n, qber_upper, leaked_bits, eps_pa = eps_sec/2).
+  Alice sorteia a semente de Toeplitz (n + l - 1 bits), envia {l, seed}; Bob
+  confere que o seu l coincide (senão PostProcessingAbort "Comprimento final
+  divergente") e ambos aplicam a mesma matriz l x n à chave corrigida. Se l = 0,
+  Alice envia {"l": 0} e a chave sai vazia, sem erro.
+
+10.4 authentication
+-------------------
+  authentication(link, auth_pool, raise_on_failure=True, verbose=True)
+      -> AuthResult
+
+  Deve ser a ÚLTIMA etapa: só depois dela a chave final pode ser usada.
+    1) consome 381 bits do reservatório e os divide em r, OTP_A, OTP_B;
+    2) calcula a transcrição (`link.transcript_bytes()`), que inclui TUDO que
+       foi trocado (sifting, PE, EC, verificação, PA);
+    3) cada lado calcula SUA tag com um rótulo de domínio:
+         Alice: wc_tag(b"A" + transcrição, r, OTP_A)
+         Bob:   wc_tag(b"B" + transcrição, r, OTP_B)
+       e os dois trocam as tags numa única `exchange`;
+    4) cada um verifica a tag do outro contra a transcrição QUE ELE registrou
+       (comparação em tempo constante, `secrets.compare_digest`).
+  Se a verificação falhar e `raise_on_failure`, levanta AuthenticationError.
+
+10.5 run_postprocessing (orquestrador)
+--------------------------------------
+  run_postprocessing(sifted_key, link, auth_pool, ec_method="cascade",
+                     sample_fraction=0.20, qber_threshold=0.11, eps_sec=1e-9,
+                     eps_cor=1e-10, replenish_auth=True, ec_kwargs=None,
+                     verbose=True) -> PostProcessResult
+
+  Executa PE (com eps_pe = eps_sec/4) -> EC -> PA -> AUTH. Se `replenish_auth` e
+  a chave final tem mais de 381 bits, os ÚLTIMOS 381 bits da chave final são
+  devolvidos ao reservatório (`auth_pool.add`) e removidos da chave entregue.
+  Portanto `final_key` já é a chave líquida, depois da reposição. A reposição
+  só ocorre se a autenticação passou (uma falha levanta exceção antes).
+
+
+================================================================================
+11. REFERÊNCIA: ALICE.py E BOB.py  (PROGRAMAS PRINCIPAIS)
+================================================================================
+
+11.1 Estrutura comum
+--------------------
+Os dois programas têm a mesma estrutura:
+
+  1. Constantes lidas do ambiente (EC_METHOD, AUTH_KEY_FILE, CAPTURE_S,
+     CLASSIC_PORT) e instalação do hardware simulado com seed=42.
+  2. `with <Canal>(...) as channel:` abre a conexão TCP única.
+  3. Cria `BBM92HardwareManager`, calibra os atrasos e captura.
+  4. `BBM92ProtocolEngine(coincidence_window_ps=800).process_time_tags(...)`.
+  5. Monta {"ts": valid_ts.tolist(), "bases": bases.tolist()}, troca com o
+     outro nó via `channel.exchange(json.dumps(...))` e faz o sifting.
+  6. Se a chave peneirada tem 0 bits, imprime o erro e encerra.
+  7. Cria o `ClassicalLink`, registra o sifting na transcrição com
+     `link.record(...)`, carrega o `AuthKeyPool` e chama `run_postprocessing`,
+     capturando `PostProcessingError` (imprime "[ABORTADO] <Tipo>: <msg>" e sai).
+  8. Imprime o bloco "RESULTADOS FINAIS".
+
+11.2 Diferenças entre os dois
+-----------------------------
+                      ALICE.py                         BOB.py
+  ------------------  -------------------------------  -------------------------------
+  Canal               AliceClassicalChannel(port)      BobClassicalChannel(host, port)
+  Papel TCP           servidor (espera Bob)            cliente (exige ALICE_HOST)
+  node_type           'Alice'                          'Bob'
+  Calibração          {1:0, 2:50, 3:0, 4:50}           {5:12500, 6:12550, 7:12500, 8:12550}
+  perform_sifting     is_bob=False                     is_bob=True (inverte os bits)
+  ClassicalLink       role="alice"                     role="bob"
+  link.record         (alice_msg=minha, bob_msg=       (alice_msg=recebida, bob_msg=
+                       recebida)                        minha)
+  Extra               imprime o IP local               aborta se ALICE_HOST estiver vazio
+
+O `link.record` garante que a transcrição seja IDÊNTICA nos dois nós (primeiro a
+mensagem de Alice, depois a de Bob), requisito para a tag de autenticação.
+
+11.3 Saída final
+----------------
+    === RESULTADOS FINAIS EM ALICE (ou BOB) ===
+    Largura Total Peneirada: <bits após o sifting>
+    Taxa QBER (amostra): x.xx%  (limite superior: y.yy%)
+    Correção de erros (<método>): eficiência f = z.zzz, <N> bits revelados
+    Chave Secreta Final: <vetor de bits>
+    Largura da Chave Secreta (Final Key Size): <bits>
+    [SUCESSO] Chave segura e autenticada gerada em Alice/Bob.
+        (ou, se a chave for vazia:)
+    [ALERTA] Chave final vazia (custo de tamanho finito / QBER alta). Aumente a
+    duração de captura.
+
+"<N> bits revelados" é `ec.leaked_bits` (inclui o hash de verificação). A
+"Chave bruta" impressa antes do sifting é o vetor de bits de todas as detecções
+(NumPy abrevia a exibição); não é um comprimento (ver observação 16.2).
+
+11.4 Códigos de situação
+------------------------
+  [ALICE][ERRO] / [BOB][ERRO]  nenhuma coincidência após o sifting.
+  [ALICE][ABORTADO] / [BOB][ABORTADO] <TipoDaExceção>: <msg>
+                               QBER alta, chave curta, verificação, autenticação,
+                               chave de autenticação esgotada, etc.
+  [ALERTA]                     execução correta, mas chave final vazia.
+  [SUCESSO]                    chave final não vazia e autenticada.
+
+
+================================================================================
+12. MENSAGENS TROCADAS NA REDE (FORMATO POR FASE)
+================================================================================
+
+Todas as mensagens são JSON em UTF-8, com o enquadramento da seção 8.1. Tudo o
+que trafega é público. Cada linha abaixo é uma troca lógica (Alice <-> Bob).
+
+  Fase / direção                     Conteúdo
+  ---------------------------------  -----------------------------------------------
+  SIFTING   Alice e Bob (troca)      {"ts": [int ps, ...], "bases": ["Z"|"X", ...]}
+                                     (nenhum bit; ~20 bytes por detecção)
+
+  PE        Alice -> Bob             {"n": N, "idx": [posições], "bits": hex}
+            Bob -> Alice             {"errors": int}  ou  {"abort": "motivo"}
+
+  CASCADE   Alice -> Bob             {"seed": int, "sizes": [k por passagem],
+                                      "par": [hex de paridades por passagem]}
+            (repetido) Bob -> Alice  {"q": [...], "a": [...], "b": [...]}
+                                      (paridades pedidas: passagem q, intervalo [a,b))
+            (repetido) Alice -> Bob  {"bits": hex}
+            fim: Bob -> Alice        {"done": true}
+
+  LDPC      Alice -> Bob             {"frames": [{"n_k","m","d","seed","p":[...],
+                                       "syn": hex}, ...], "q": q_eff}
+            Bob -> Alice             {"failed": [índices de quadros]}
+            Alice -> Bob (se falhou) {"reveal": {"<i>": hex dos bits punçados}}
+            (repete até convergir ou esgotar a escada de eficiências)
+
+  VERIF.    Alice -> Bob             {"m": 34, "seed": hex, "tag": hex}
+            Bob -> Alice             {"ok": true|false}
+
+  PA        Alice -> Bob             {"l": comprimento, "seed": hex}  (ou {"l": 0})
+
+  AUTH      Alice e Bob (troca)      {"tag": 32 dígitos hex}
+
+O número de mensagens do Cascade cresce com o número de rodadas de busca binária;
+o do LDPC é pequeno. Medido, contando a transcrição inteira da sessão: ~50 a 130
+mensagens com Cascade e ~10 a 14 com LDPC. Cada mensagem lógica custa uma troca
+TCP de duas mensagens (seção 5.3).
+
+
+================================================================================
+13. PARÂMETROS DE SEGURANÇA E FÓRMULAS
+================================================================================
+
+13.1 Parâmetros e valores padrão
+--------------------------------
+  Parâmetro        Valor      Papel
+  ---------------  ---------  ----------------------------------------------------
+  eps_sec          1e-9       parâmetro de segurança total (run_postprocessing)
+  eps_pe           2,5e-10    = eps_sec/4; usado no limite de Serfling
+  eps_pa           5e-10      = eps_sec/2; usado no Leftover Hash Lemma
+  eps_cor          1e-10      prob. máx. de as chaves ainda diferirem após a
+                              verificação (hash de 34 bits)
+  sample_fraction  0,20       fração da chave peneirada sacrificada para estimar a QBER
+  qber_threshold   0,11       aborta se a QBER da amostra o ultrapassar
+  n_passes         4          passagens do Cascade
+  frame_size       8192       tamanho de quadro do LDPC
+  AUTH_BITS        381        chave de autenticação consumida por sessão
+
+13.2 Estimação de parâmetros
+----------------------------
+A amostra é aleatória e sem reposição. Pelo teorema de Serfling (eq. 4.34 citada
+nos comentários), com probabilidade >= 1 - eps_pe a taxa de erro do restante da
+chave não excede qber + mu. Em BBM92 o erro de FASE nas bases X/Z é limitado
+pelo erro de BIT estimado; por isso e_fase <= qber_upper = qber + mu.
+
+Para chaves curtas, mu domina: com os valores padrão, mu ~ sqrt(69/N) (N = bits
+peneirados). Com N = 3.000, mu ~ 15%; com N = 15.000, mu ~ 7%.
+
+13.3 Comprimento da chave final
+-------------------------------
+    l = floor( n (1 - h2(e_fase)) - leak_EC - leak_verif + 2 - 2 log2(1/eps_pa) )
+
+  n          bits após PE e EC (chaves idênticas);
+  e_fase     qber_upper;
+  leak_EC    paridades (Cascade) ou síndromes menos bits punçados (LDPC);
+  leak_verif bits do hash de verificação (34).
+  O termo 2 - 2 log2(1/eps_pa) vale ~ -59,8 bits com os valores padrão (custo
+  de tamanho finito); l nunca é negativo (mínimo 0).
+
+Exemplo real (execução de 2 s, Cascade, valores variam por execução):
+  N peneirada = 6081; amostra k = 1216 (30 erros: QBER 2,47%); n = 4865
+  mu = 0,1066 -> e_fase <= 13,13%  ->  n (1 - h2) = 4865 x 0,439 = 2135,6
+  vazamento = 1006 (972 de Cascade + 34 de verificação)
+  l = floor(2135,6 - 1006 - 59,8) = 1069 bits.
+  Como 1069 > 381, 381 bits voltam ao reservatório e a chave entregue tem 688.
+  (Em outra execução do mesmo teste, 708: a amostra de PE é aleatória.)
+
+13.4 Autenticação (Wegman-Carter)
+---------------------------------
+  tag_A = PolyHash_r(b"A" || T) XOR OTP_A        tag_B = PolyHash_r(b"B" || T) XOR OTP_B
+
+  T = transcrição completa (seção 9.2). A probabilidade de forjar é <= L/p
+  (p = 2^127 - 1, L = nº de blocos de 14 bytes de T), irrelevante na prática,
+  independentemente do poder computacional do atacante (segurança teórico-
+  informacional, desde que r e os OTPs nunca se repitam).
+  Pontos de projeto:
+    * rótulos "A"/"B" e OTPs distintos por direção evitam ataques de reflexão;
+    * qualquer mensagem alterada, removida, inserida ou reordenada muda T;
+    * a verificação é feita NO FINAL, para toda a sessão de uma vez: até lá, as
+      mensagens não estão autenticadas. Por isso a chave só pode ser usada
+      depois de `authentication` passar, e deve ser descartada se falhar;
+    * a chave de autenticação é pré-compartilhada e finita; o QKD a repõe com
+      parte da chave gerada (seção 3.5).
+
+13.5 O que isto garante (e o que não)
+--------------------------------------
+  * Dado um canal quântico real, a cadeia segue o fluxo padrão de QKD com
+    segurança de tamanho finito (PE + EC verificada + PA + autenticação).
+  * No modo simulado, as correlações quânticas são sorteadas por um gerador
+    pseudoaleatório conhecido por ambos (seed=42): a chave resultante NÃO é
+    segura. A simulação serve para validar o software e o desempenho.
+  * Os resultados impressos (inclusive a chave) vão para a saída padrão. Em
+    uso real, não imprima a chave final (observação 16.2).
+
+
+================================================================================
+14. DESEMPENHO E DIMENSIONAMENTO (MEDIÇÕES)
+================================================================================
+
+14.1 Como foram feitas as medições
+----------------------------------
+Foi criado um script de teste que reproduz o fluxo de ALICE.py/BOB.py num único
+processo: duas capturas simuladas (seed=42, pair_rate=3e6, janela de 800 ps, as
+mesmas calibrações), sifting, e `run_postprocessing` nos dois nós em duas
+threads ligadas por `make_local_link_pair()` (sem rede TCP, portanto sem latência
+de rede). Ambiente: Python 3.12, NumPy 2.4, 4 GB de RAM. Uma execução por linha;
+a chave peneirada é reprodutível (seed fixa), mas a chave final varia um pouco
+entre execuções (amostra de PE, sementes do Cascade/Toeplitz usam `secrets`).
+
+14.2 Resultados: Cascade, sem espiã
+-----------------------------------
+ Captura      Detecções      Peneirada   QBER real     QBER      Limite     f    Vazados   Chave final
+   (s)        Alice/Bob        (bits)    peneirada   amostra    superior          (bits)    (entregue)
+ -------  -----------------  ----------  ----------  --------  ---------  -----  --------  ------------
+   0,01      1.499/1.240         15         0,0%       0,0%      50,0%     n/d      41          0
+   0,1      15.077/12.088       279         2,5%       7,1%      50,0%     0,62     85          0
+   0,5      76.042/60.374      1.473        1,7%       1,4%      23,0%     1,41    206          0
+    1      151.913/120.583     3.108        2,7%       3,1%      18,0%     1,02    534         203
+    2      303.982/241.091     6.081        2,6%       2,2%      12,9%     1,32   1.019      708 (*)
+    5      759.298/605.269     14.939       2,3%       2,4%       9,2%     1,09   2.183     4.013 (*)
+   10      (processo encerrado por falta de memória no teste de 4 GB; ver 14.4)
+
+  (*) já descontados os 381 bits devolvidos ao reservatório de autenticação
+      (antes da reposição: 1089 e 4394 bits).
+
+Leituras práticas, com os parâmetros padrão:
+  * ~3.100 bits peneirados por segundo de captura (QBER real ~2-3%).
+  * A chave final só aparece a partir de ~1 s de captura; antes disso, o custo
+    de tamanho finito (mu grande e -59,8 bits) consome tudo, e o programa avisa
+    "[ALERTA] Chave final vazia".
+  * Com 5 s de captura: ~4.000 bits de chave líquida (~800 bits por segundo de
+    captura), e o limite superior da QBER cai para ~9%.
+  * A eficiência f do Cascade flutua bastante com poucas dezenas de erros
+    (0,6 a 1,4 em chaves curtas) e estabiliza perto de 1,1 em chaves de ~15 mil bits.
+
+14.3 Cascade vs. LDPC
+---------------------
+ LDPC (mesmas condições):
+   1 s  ->  quadro único de ~2,5 mil bits descartado numa execução (chave vazia);
+            em outra execução do mesmo caso o quadro convergiu (vazados 554).
+   2 s  ->  f = 1,25; 771 bits de PA, 390 entregues (após reposição).
+   5 s  ->  f = 1,36; 4.193 bits de PA, 3.812 entregues; ~4,5 s de CPU (BP em Python).
+ Conclusões:
+   * Para chaves curtas (< ~3 mil bits) prefira CASCADE (padrão): o LDPC pode
+     descartar o quadro porque a taxa do código é escolhida a partir da QBER
+     da amostra (que é ruidosa), e um quadro curto tem pouca margem.
+   * Para chaves longas, o LDPC usa bem menos rodadas de rede (~10 mensagens
+     por sessão contra dezenas/centenas no Cascade), ao custo de f maior
+     (~1,3 contra ~1,1) e de mais CPU.
+
+14.4 Consumo de memória
+-----------------------
+Dois pontos concentram a memória:
+
+ (a) Simulador (SIMLINK.generate): aloca vetores para TODOS os pares gerados,
+     inclusive os não detectados. Medido: pico de ~2,9 GB para uma captura de
+     10 s com pair_rate=3e6 (30 milhões de pares, ~100 bytes por par). Regra
+     prática: ~0,3 GB por segundo de captura (pico transitório, por nó).
+
+ (b) Hash de Toeplitz (privacy_amp): `toeplitz_hash` materializa a matriz l x n
+     (índices int64 + matriz uint8 + produto). Medido:
+         n x l = 2,0e6  -> ~ 20 MB       n x l = 5,0e7  -> ~ 480 MB
+         n x l = 1,25e7 -> ~120 MB       n x l = 1,1e8  -> ~1,1 GB
+     ou seja, ~9,5 bytes por elemento de (n x l), tempo e memória O(n x l).
+     Estimativa para captura de 10 s: n ~ 24 mil, l ~ 10 mil -> ~2,4 GB por nó.
+     No teste de 10 s, com os dois nós no mesmo processo (4 GB), o processo foi
+     encerrado pelo sistema por falta de memória.
+ Recomendações: use capturas de até alguns segundos; para sessões longas,
+ troque o Toeplitz por uma versão por blocos ou por FFT (convolução), ou divida
+ a chave em blocos e faça a amplificação de privacidade por bloco.
+
+14.5 Tráfego de rede
+--------------------
+  * Sifting: ~20 bytes por detecção em cada sentido (timestamp ~13 dígitos +
+    base), ou seja, ~3 MB por lado por segundo de captura (estimativa a partir
+    de ~150 mil detecções/s). É a maior mensagem da sessão e domina o tráfego.
+  * O restante (PE, EC, PA, AUTH) soma dezenas de kB (transcrições medidas de
+    ~5 kB a ~50 kB sem contar o sifting, para capturas de 1 a 5 s).
+  * Mensagens por sessão (transcrição inteira): ~50 a 130 com Cascade; ~10 a 14
+    com LDPC.
+  * Tempo de CPU do pós-processamento (sem rede): centésimos de segundo a
+    ~1 s com Cascade para capturas de até 5 s; vários segundos com LDPC.
+
+14.6 Teste local sem rede (exemplo de uso da API)
+--------------------------------------------------
+    import threading, json
+    from AUXILIARY import make_local_link_pair, AuthKeyPool, random_bits
+    from POSTPROCESS import run_postprocessing
+
+    # sifted_alice / sifted_bob: chaves peneiradas (np.uint8) de mesmo tamanho
+    link_a, link_b = make_local_link_pair()
+    bits = random_bits(8192)                       # mesmo reservatório nos dois
+    pool_a, pool_b = AuthKeyPool(bits), AuthKeyPool(bits)   # (sem path: só em memória)
+    # se houve sifting fora do link, registre igual nos dois:
+    link_a.record("msg_alice", "msg_bob"); link_b.record("msg_alice", "msg_bob")
+
+    res = {}
+    def run(name, key, link, pool):
+        res[name] = run_postprocessing(key, link, pool, ec_method="cascade", verbose=False)
+    ta = threading.Thread(target=run, args=("a", sifted_alice, link_a, pool_a))
+    tb = threading.Thread(target=run, args=("b", sifted_bob,   link_b, pool_b))
+    ta.start(); tb.start(); ta.join(); tb.join()
+    assert (res["a"].final_key == res["b"].final_key).all()
+
+Se uma das threads levantar PostProcessingError, a outra pode ficar esperando;
+trate a exceção dentro de `run` (como em ALICE.py/BOB.py).
+
+
+================================================================================
+15. SOLUÇÃO DE PROBLEMAS
+================================================================================
+
+  Sintoma / mensagem                          Causa provável e ação
+  ------------------------------------------  -----------------------------------------
+  Bob: "Defina o IP de Alice na rede..."      ALICE_HOST não definido. Rode ALICE.py,
+  (SystemExit)                                copie o IP impresso e exporte ALICE_HOST.
+
+  ValueError "bob_classical_channel: 'host'   Foi informado localhost/127.0.0.1/::1.
+  precisa ser o endereço IP real..."          Use o IP da LAN de Alice (mesmo que seja
+                                              a própria máquina).
+
+  ConnectionError "Não foi possível conectar  Alice não iniciou, IP/porta errados ou
+  a Alice ... após 30s"                       firewall bloqueando a porta. Inicie
+                                              Alice primeiro e libere CLASSIC_PORT.
+
+  "[...][ERRO] Nenhuma coincidência foi       Os dois mundos simulados divergem:
+  encontrada entre Alice e Bob"               seed, CAPTURE_S, pair_rate_hz ou flag de
+                                              espiã diferentes; versões de NumPy
+                                              diferentes; calibração de atraso errada.
+
+  Programa trava em silêncio                  Não há timeout de leitura. Causas:
+                                              EC_METHOD/parâmetros diferentes entre
+                                              os nós, ou o outro nó terminou/caiu.
+                                              Reinicie os dois com a mesma configuração.
+
+  "PostProcessingAbort: Chave peneirada       Captura curta demais (amostra vazia).
+  pequena demais (N bits)..."                 Aumente CAPTURE_S.
+
+  "PostProcessingAbort: QBER=xx% acima do     Espiã ligada (eve_intercept_resend=True),
+  limite de 11%..."                           ruído excessivo ou calibração ruim.
+                                              Comportamento esperado quando há Eve.
+
+  "[ALERTA] Chave final vazia"                Sem erro: custo de tamanho finito. Aumente
+                                              CAPTURE_S (>= ~1 s; veja 14.2).
+
+  AuthenticationError                         Transcrição adulterada ou reservatórios
+                                              de autenticação dessincronizados (arquivos
+                                              diferentes, ou `pos` diferente). Descarte
+                                              a chave e regenere/redistribua auth_key.json.
+
+  AuthKeyExhausted                            Acabou a chave de autenticação. Gere e
+                                              distribua um novo auth_key.json.
+
+  FileNotFoundError auth_key.json             O reservatório não existe. Gere com
+                                              `python AUXILIARY.py --gen-auth-key ...`.
+                                              (Esta exceção NÃO é capturada por
+                                              ALICE.py/BOB.py; ocorre após o sifting.)
+
+  "Verificação da correção de erros falhou"   As chaves continuam diferentes após o EC
+                                              (evento raro, prob. <= eps_cor).
+                                              Protocolo abortado; refaça a sessão.
+
+  "Comprimento final divergente entre nós"    Alice e Bob calcularam l diferentes:
+                                              parâmetros divergentes (eps_sec etc.).
+
+  f = nan na saída                            QBER da amostra foi 0%. Sem problema; a
+                                              eficiência é indefinida.
+
+  Processo "Killed" / MemoryError             Captura longa demais (seção 14.4).
+                                              Reduza CAPTURE_S.
+
+  OSError "Address already in use"            Outro processo ainda usa a porta (o
+                                              SO_REUSEADDR já está ativo). Mude
+                                              CLASSIC_PORT nos dois nós.
+
+
+================================================================================
+16. OBSERVAÇÕES, LIMITAÇÕES E PONTOS DE ATENÇÃO DO CÓDIGO
+================================================================================
+
+Itens observados na leitura dos arquivos. Nenhum impede o funcionamento no modo
+simulado; são pontos a conhecer (ou corrigir) antes de evoluir o projeto.
+
+16.1 BBM92.py está acoplado ao simulador
+  As duas primeiras linhas instalam o hardware simulado incondicionalmente. Para
+  hardware real é preciso removê-las (seção 17). Como ALICE.py/BOB.py também
+  instalam o simulador (com seed=42), a instalação em BBM92.py é redundante.
+
+16.2 Impressão de vetores e da chave secreta
+  * "Chave bruta: {key} bits" imprime o vetor NumPy inteiro (abreviado pelo
+    NumPy) em vez de um comprimento; provavelmente a intenção era imprimir
+    `sifted_len`.
+  * "Chave Secreta Final: {res.final_key}" escreve a chave na saída padrão
+    (terminal/logs). Em uso real, evite imprimir ou registrar a chave.
+
+16.3 Limiar de aborto
+  O aborto por QBER compara o QBER da AMOSTRA com 11%, não o limite superior
+  (qber_upper = qber + mu). Com chaves curtas, qber_upper pode superar 11% (até
+  50%) sem abortar; o resultado é uma chave final vazia (l = 0), não um aborto.
+
+16.4 Sinal da calibração de Alice
+  O simulador soma `delay_ps` aos timestamps. Em Bob, +12500/+12550 cancelam os
+  desvios de -12500/-12550. Em Alice, os desvios intrínsecos são +50 ps nos
+  canais 2 e 4 e a calibração também SOMA +50, o que leva o descasamento
+  relativo desses canais de 50 para 100 ps. É irrelevante frente à janela de
+  800 ps e ao jitter (~150 ps por detector), mas indica que o sinal da
+  calibração de Alice não "cancela" o desvio como o de Bob.
+
+16.5 Docstring e CLI do SIMLINK desatualizados em relação ao BBM92.py atual
+  A docstring descreve um bloco `__main__` em BBM92.py que calibra só os canais
+  H/V (1, 2, 5, 6). O BBM92.py fornecido não tem bloco `__main__`, e ALICE.py/BOB.py
+  calibram os 4 canais de cada nó. Assim, `python SIMLINK.py` apenas importa
+  BBM92.py e não produz saída útil; o fluxo real é por ALICE.py e BOB.py.
+
+16.6 Memória
+  O simulador (~100 bytes por par gerado) e o `toeplitz_hash` (~9,5 bytes por
+  elemento de n x l) limitam o tamanho prático das sessões (seção 14.4).
+
+16.7 Timeouts e exceções
+  * O canal não tem timeout de leitura e `accept()` de Alice bloqueia sem
+    limite; se um nó cair ou o roteiro divergir, o outro pode travar.
+  * ALICE.py/BOB.py só capturam `PostProcessingError`. Outras exceções
+    (FileNotFoundError do auth_key.json, ConnectionError, ValueError de um
+    EC_METHOD inválido, MemoryError) encerram o programa com traceback.
+  * `AuthKeyPool.load` é chamado depois do sifting; um auth_key.json ausente só
+    é descoberto no fim dessa etapa.
+
+16.8 Sorteio da amostra de PE
+  A amostra usa `RandomState(secrets.randbits(32))`: é imprevisível na prática,
+  mas o espaço de amostras possíveis fica limitado a 2^32 sementes (e não a todas
+  as combinações). Como os índices são enviados a Bob em seguida, isso importa
+  pouco; se desejado, pode-se usar o CSPRNG diretamente (por exemplo,
+  `secrets.SystemRandom().sample`).
+
+16.9 Utilitários presentes mas não usados no fluxo
+  `BBM92ProtocolEngine.calculate_qber`, `run_bbm92` e a CLI do SIMLINK não fazem
+  parte do caminho ALICE.py/BOB.py.
+
+16.10 Desempenho em Python puro
+  `process_time_tags` e `perform_sifting` usam laços Python sobre cada detecção
+  (~150 mil por segundo de captura), e o sifting serializa os timestamps em JSON.
+  Para capturas longas, vetorize esses laços (NumPy) e troque o formato por um
+  binário compacto.
+
+16.11 Compatibilidade de versões
+  Alice e Bob devem usar a mesma versão do NumPy (seção 3.4). A parte
+  "pública e reprodutível" do pós-processamento (RandomState) é estável entre
+  versões; o simulador (Generator) não é.
+
+
+================================================================================
+17. MIGRAÇÃO PARA HARDWARE REAL
+================================================================================
+
+  1. Instale o driver: `pip install Swabian-TimeTagger` (Linux e Windows) e
+     conecte o(s) Time Tagger(s).
+  2. Remova o simulador:
+       * BBM92.py: apague `import SIMLINK` e a chamada
+         `SIMLINK.install_simulated_hardware(...)` (linhas 1-2);
+       * ALICE.py e BOB.py: apague `import SIMLINK` e a chamada
+         `SIMLINK.install_simulated_hardware(...)`.
+     O SIMLINK.py pode permanecer no diretório sem ser importado.
+  3. Se houver mais de um Time Tagger na máquina, passe o número de série:
+     `BBM92HardwareManager(node_type='Alice', serial_number='...')` (o
+     parâmetro existe, mas ALICE.py/BOB.py não o utilizam hoje).
+  4. Recalibre os atrasos: substitua os valores de `calibrate_delays` pelos
+     medidos no seu arranjo (por exemplo, por correlação cruzada entre os
+     timestamps de Alice e Bob). Os números 50/12500/12550 pertencem ao
+     simulador.
+  5. Sincronização: o código assume timestamps em base de tempo comum (relógio
+     de referência compartilhado, como o Rb da arquitetura descrita no SIMLINK)
+     e não alinha a origem dos dois taggers nem coordena o início das capturas;
+     isso deve ser resolvido fora do código.
+  6. Parâmetros que deixam de valer: seed e pair_rate (só do simulador). A
+     exigência de CAPTURE_S igual nos dois nós deixa de ser necessária para a
+     correção do sifting, mas ambos devem capturar na mesma janela de tempo.
+  7. Confirme que a versão do driver expõe a mesma API usada (`TimeTagStream`
+     com `start/stop/getEvents`, `getTimestamps`, `getChannels`, `setInputDelay`,
+     `sync`).
+  8. Revise o pós-processamento para o seu regime: tamanho de captura, limiar de
+     QBER e fração de amostra, e use memória adequada para a etapa de Toeplitz.
+
+
+================================================================================
+18. GLOSSÁRIO
+================================================================================
+  AUTH             Etapa de autenticação da transcrição do canal clássico.
+  BBM92            Protocolo de QKD por pares emaranhados (Bennett-Brassard-Mermin, 1992).
+  BP               Belief Propagation (propagação de crenças), decodificador do LDPC.
+  Cascade          Protocolo interativo de correção de erros por paridades e busca binária.
+  Coincidência     Duas detecções, uma em cada nó, dentro da janela de coincidência.
+  Dark count       Detecção espúria do SPAD sem fóton incidente.
+  EC               Error Correction (correção de erros / reconciliação).
+  EPS              Entangled Photon Source, fonte de pares emaranhados (SPDC).
+  Eficiência f     Vazamento do EC dividido por n h2(QBER); 1,0 = limite de Shannon.
+  e_fase           Erro de fase, limitado aqui por qber + mu.
+  Jitter           Incerteza temporal da detecção (~350 ps FWHM no SPAD simulado).
+  Leftover Hash    Lema que dimensiona a amplificação de privacidade com hash 2-universal.
+  LDPC             Low-Density Parity-Check, código usado na reconciliação por síndrome.
+  LLR              Log-likelihood ratio; > 0 indica bit 0.
+  Lockstep         Alice e Bob seguem o mesmo roteiro; cada mensagem casa com a do par.
+  mu               Margem de Serfling somada à QBER da amostra.
+  OTP              One-Time Pad; aqui, máscara de uso único da tag de autenticação.
+  PA               Privacy Amplification (amplificação de privacidade).
+  PAM              Módulo de análise de polarização (escolha passiva de base).
+  PE               Parameter Estimation (estimação de parâmetros / QBER).
+  Puncionamento    Bits do LDPC desconhecidos de Bob, revelados gradualmente.
+  QBER             Quantum Bit Error Rate.
+  QKD              Quantum Key Distribution.
+  Serfling         Limite de concentração para amostragem sem reposição.
+  Sifting          Peneiramento: manter só eventos coincidentes com bases iguais.
+  SPAD             Single-Photon Avalanche Diode.
+  SPDC             Spontaneous Parametric Down-Conversion.
+  Síndrome         s = H x; informação de paridade enviada no LDPC.
+  Time tag         Par (instante, canal) de cada detecção registrada.
+  Toeplitz         Matriz de diagonais constantes; hash 2-universal.
+  Transcrição      Registro de todas as mensagens do canal clássico da sessão.
+  Wegman-Carter    MAC teórico-informacional: hash universal + one-time pad.
+
+
+================================================================================
+19. REFERÊNCIAS CITADAS NOS CÓDIGOS
+================================================================================
+  * Brassard, G. e Salvail, L., "Secret-Key Reconciliation by Public Discussion"
+    (Cascade), 1993.
+  * Martinez-Mateo, J. et al., Quantum Information & Computation 15 (2015)
+    (variantes e passagens extras do Cascade).
+  * Elkouss, D., Leverrier, A., Alléaume, R. e Boutros, J., ISIT 2009; e
+    Elkouss, D., Martinez, J., Martin, V., QIC 2011 (LDPC rate-adaptive,
+    reconciliação por síndrome).
+  * Krzic, A., "Development and Characterization of an Entanglement-based
+    Free-Space QKD System" (dissertação; capítulos 2 e 3), base dos parâmetros do
+    SIMLINK.py (SPADs, dark counts, janela de 800 ps, QBER).
+  * WOLF, Ramona. Quantum Key Distribution. Cham: Springer International 
+    Publishing, 2021. é citado em AUXILIARY.py/POSTPROCESS.py (Teorema 4.5/eq. 4.34, 
+    seções 4.2.1 e 4.2.2, Lema 4.9/eq. 4.44).
+  * Projeto https://github.com/Manolo789/SeQUeNCe-QKDprotocols, mencionado no
+    SIMLINK.py como trabalho complementar de simulação de rede/rádio.
+
+--------------------------------------------------------------------------------
+FIM DA DOCUMENTAÇÃO
+--------------------------------------------------------------------------------
