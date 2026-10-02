@@ -1,7 +1,6 @@
 import json
 import os
 import numpy as np
-import SIMLINK
 from BBM92 import BBM92HardwareManager, BBM92ProtocolEngine
 from CLASSIC_CHANNEL import BobClassicalChannel
 from AUXILIARY import AuthKeyPool, ClassicalLink, PostProcessingError
@@ -13,7 +12,10 @@ AUTH_KEY_FILE = os.environ.get("AUTH_KEY_FILE", "auth_key.json")
 CAPTURE_S = float(os.environ.get("CAPTURE_S", "0.01"))       # duração da captura (s); IGUAL em Alice e Bob
 CLASSIC_PORT = int(os.environ.get("CLASSIC_PORT", "65432"))   # ÚNICA porta TCP (sifting + pós-processamento); IGUAL em Alice e Bob
 
-SIMLINK.install_simulated_hardware(pair_rate_hz=3e6, eve_intercept_resend=False, seed=42)
+# Utilizar apenas no teste de hardware simulado
+#import SIMLINK
+#SIMLINK.install_simulated_hardware(pair_rate_hz=3e6, eve_intercept_resend=False, seed=42)
+
 # ALICE_HOST=<IP DE ALICE> python BOB.py
 ALICE_HOST = os.environ.get("ALICE_HOST", "").strip()
 
