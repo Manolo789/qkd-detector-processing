@@ -37,10 +37,13 @@ def main():
     #    no sifting e reaproveitado, pelo ClassicalLink, em todo o pós-processamento.
     with AliceClassicalChannel(port=CLASSIC_PORT) as channel:
         hw = BBM92HardwareManager(node_type='Alice')
-        hw.calibrate_delays({1: 0, 2: 50, 3: 0, 4: 50})
+        try:
+            hw.calibrate_delays({1: 0, 2: 50, 3: 0, 4: 50})
 
-        print("[ALICE] Realizando capturas do SPAD...")
-        timestamps, channels = hw.capture_stream(duration_s=CAPTURE_S)
+            print("[ALICE] Realizando capturas do SPAD...")
+            timestamps, channels = hw.capture_stream(duration_s=CAPTURE_S)
+        finally:
+            hw.close()  # libera o Time Tagger (freeTimeTagger); só a captura usa o hardware
 
         engine = BBM92ProtocolEngine(coincidence_window_ps=800)
         key, sifted_len = engine.process_time_tags(timestamps, channels)

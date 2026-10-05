@@ -3,48 +3,133 @@
 #SIMLINK.install_simulated_hardware(pair_rate_hz=3e6, eve_intercept_resend=False)
 
 
+import warnings
+
 import Swabian.TimeTagger as TT
 import numpy as np
 
 # Install Swabian with 'pip install Swabian-TimeTagger' in Linux and Windows
+# API de referência: Time Tagger User Manual (release 2.22.6.0).
 
 class BBM92HardwareManager:
     """Interface com o Swabian TimeTagger configurável por nó."""
+
+    # Tamanho padrão do buffer do TimeTagStream (n_max_events), em eventos.
+    DEFAULT_MAX_EVENTS = 10_000_000
+
     def __init__(self, node_type, serial_number=None):
+        # Valida o nó ANTES de abrir o dispositivo, para não deixar o Time
+        # Tagger ocupado se o argumento estiver errado.
+        if node_type.upper() == 'ALICE':
+            channels = {'H': 1, 'V': 2, 'D': 3, 'A': 4}
+        elif node_type.upper() == 'BOB':
+            channels = {'H': 5, 'V': 6, 'D': 7, 'A': 8}
+        else:
+            raise ValueError("O nó deve ser 'Alice' ou 'Bob'")
+        self.channels = channels
+
+        # createTimeTagger(serial="") conecta ao primeiro dispositivo livre;
+        # com serial, ao dispositivo específico. Levanta RuntimeError se não
+        # houver dispositivo ou se o serial estiver incorreto.
         if serial_number:
             self.tagger = TT.createTimeTagger(serial_number)
         else:
             self.tagger = TT.createTimeTagger()
-            
-        # Define os canais baseado em qual nó está instanciando a classe
-        if node_type.upper() == 'ALICE':
-            self.channels = {'H': 1, 'V': 2, 'D': 3, 'A': 4}
-        elif node_type.upper() == 'BOB':
-            self.channels = {'H': 5, 'V': 6, 'D': 7, 'A': 8}
-        else:
-            raise ValueError("O nó deve ser 'Alice' ou 'Bob'")
-        
+
+        # Metadados da última captura (preenchidos por capture_stream).
+        self.last_capture = {}
+
     def calibrate_delays(self, delays_ps: dict):
         """
         Compensa diferenças nos comprimentos de fibra óptica/cabeamento.
-        delays_ps: ex. {1: 0, 2: 120, 5: 3500, ...} em picossegundos.
+        delays_ps: ex. {1: 0, 2: 120, ...} em picossegundos (inteiros).
+        Canais que não pertencem a este nó são ignorados (com aviso).
         """
+        own = set(self.channels.values())
         for ch, delay in delays_ps.items():
-            self.tagger.setInputDelay(ch, delay)
-            
-    def capture_stream(self, duration_s: float):
-        """Coleta marcas de tempo brutas por um intervalo de tempo."""
-        stream = TT.TimeTagStream(self.tagger, buffer_size=10_000_000, channels=list(self.channels.values()))
-
-        
-        stream.start()
+            if ch not in own:
+                warnings.warn(
+                    f"calibrate_delays: canal {ch} não pertence a este nó "
+                    f"({sorted(own)}); ignorado.", stacklevel=2)
+                continue
+            # setInputDelay(channel, delay) espera o atraso em ps como inteiro.
+            self.tagger.setInputDelay(int(ch), int(round(delay)))
+        # Garante que os atrasos já estão ativos no FPGA antes de capturar.
         self.tagger.sync()
-        import time
-        time.sleep(duration_s)
-        stream.stop()
-        
-        data = stream.getEvents()
-        return data.getTimestamps(), data.getChannels()
+
+    def capture_stream(self, duration_s: float, n_max_events: int = None):
+        """
+        Coleta marcas de tempo brutas por `duration_s` segundos de tempo do
+        fluxo de dados do Time Tagger (não do relógio do computador).
+
+        Retorna (timestamps_ps, channels) apenas com eventos do tipo
+        TagType.TimeTag, ou seja, detecções reais. Tags de erro, de
+        overflow e de eventos perdidos (MissedEvents) são descartadas, mas
+        contabilizadas em `self.last_capture` e sinalizadas por warnings.
+        """
+        if n_max_events is None:
+            n_max_events = self.DEFAULT_MAX_EVENTS
+
+        # TimeTagStream(tagger, n_max_events, channels): a medição começa a
+        # acumular dados já na criação do objeto.
+        stream = TT.TimeTagStream(self.tagger, n_max_events,
+                                  list(self.channels.values()))
+
+        # startFor() limpa o buffer e interrompe a captura sozinho após a
+        # duração dada EM PICOSSEGUNDOS (tempo do fluxo de dados). Isso evita
+        # perder tags ainda em trânsito no pipeline (latência de até ~100 ms)
+        # quando se usa sleep() + stop().
+        stream.startFor(int(round(duration_s * 1e12)))
+        timeout_ms = int((duration_s + 10.0) * 1000)
+        if not stream.waitUntilFinished(timeout_ms):
+            stream.stop()
+            raise RuntimeError(
+                f"TimeTagStream não concluiu a captura em {duration_s:.3f} s "
+                f"(+10 s de tolerância).")
+
+        data = stream.getData()
+        timestamps = np.asarray(data.getTimestamps())
+        channels = np.asarray(data.getChannels())
+        event_types = np.asarray(data.getEventTypes())
+
+        is_tag = event_types == int(TT.TagType.TimeTag)
+        n_missed = int(np.sum(np.asarray(data.getMissedEvents(), dtype=np.int64)))
+        tagger_overflows = self.tagger.getOverflowsAndClear()
+        buffer_full = int(data.size) >= n_max_events
+
+        self.last_capture = {
+            "n_events": int(data.size),
+            "n_time_tags": int(np.sum(is_tag)),
+            "n_missed_events": n_missed,
+            "has_overflows": bool(data.hasOverflows),
+            "tagger_overflows": int(tagger_overflows),
+            "buffer_full": bool(buffer_full),
+        }
+        if buffer_full:
+            warnings.warn(
+                f"TimeTagStream atingiu n_max_events={n_max_events}: eventos "
+                f"provavelmente foram descartados. Reduza a duração da captura "
+                f"ou aumente n_max_events.")
+        if data.hasOverflows or tagger_overflows or n_missed:
+            warnings.warn(
+                f"Overflow no Time Tagger (overflows={tagger_overflows}, "
+                f"eventos perdidos={n_missed}): taxa de contagem acima do "
+                f"limite do link; a chave bruta pode estar incompleta.")
+
+        return timestamps[is_tag], channels[is_tag]
+
+    def close(self):
+        """Libera o Time Tagger (freeTimeTagger). Seguro chamar mais de uma vez."""
+        tagger, self.tagger = getattr(self, "tagger", None), None
+        if tagger is not None:
+            TT.freeTimeTagger(tagger)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
 
 
 class BBM92ProtocolEngine:

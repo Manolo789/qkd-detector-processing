@@ -31,10 +31,13 @@ def main():
     #    no sifting e reaproveitado, pelo ClassicalLink, em todo o pós-processamento.
     with BobClassicalChannel(host=ALICE_HOST, port=CLASSIC_PORT) as channel:
         hw = BBM92HardwareManager(node_type='Bob')
-        hw.calibrate_delays({5: 12500, 6: 12550, 7: 12500, 8: 12550})
+        try:
+            hw.calibrate_delays({5: 12500, 6: 12550, 7: 12500, 8: 12550})
 
-        print("[BOB] Realizando capturas do SPAD...")
-        timestamps, channels = hw.capture_stream(duration_s=CAPTURE_S)
+            print("[BOB] Realizando capturas do SPAD...")
+            timestamps, channels = hw.capture_stream(duration_s=CAPTURE_S)
+        finally:
+            hw.close()  # libera o Time Tagger (freeTimeTagger); só a captura usa o hardware
 
         engine = BBM92ProtocolEngine(coincidence_window_ps=800)
         key, sifted_len = engine.process_time_tags(timestamps, channels)

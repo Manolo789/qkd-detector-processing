@@ -378,13 +378,18 @@ por mensagem lógica (por isso o Cascade foi implementado em lote, seção 9.4).
 
 6.1 Mecanismo de substituição do driver
 ---------------------------------------
-BBM92.py usa o driver real apenas por quatro chamadas:
+BBM92.py usa o driver real pelas chamadas abaixo (API do manual 2.22.6):
 
      TT.createTimeTagger()          -> SimulatedTimeTagger
+     TT.freeTimeTagger(tagger)
      tagger.setInputDelay(ch, ps)
      tagger.sync()
-     TT.TimeTagStream(tagger, buffer_size, channels)
-          .start() / .stop() / .getEvents()  (+ getTimestamps()/getChannels())
+     tagger.getOverflowsAndClear()
+     TT.TimeTagStream(tagger, n_max_events, channels)
+          .startFor(ps) / .waitUntilFinished() / .stop() / .getData()
+     getData() -> TimeTagStreamBuffer: getTimestamps(), getChannels(),
+          getEventTypes(), getMissedEvents(), size, hasOverflows
+     TT.TagType.TimeTag (filtro: só detecções reais entram na chave bruta)
 
 `install_simulated_hardware()` cria os módulos "Swabian" e "Swabian.TimeTagger"
 e os registra em `sys.modules`. Assim `import Swabian.TimeTagger as TT` em
@@ -408,11 +413,11 @@ MESMOS pares emaranhados, o SIMLINK faz duas coisas:
   (a) mesma semente (seed=42) -> mesma sequência pseudoaleatória nos dois;
   (b) mesma duração de captura. O tempo real medido nunca é idêntico entre
       máquinas, e uma diferença mínima mudaria `poisson(taxa*duração)` e
-      divergiria toda a sequência. Por isso o SIMLINK substitui `time.sleep`
-      por `_recording_sleep`, que grava o valor literal pedido (CAPTURE_S) e
-      ainda dorme de verdade. `TimeTagStream.stop()` usa esse valor literal,
-      não o tempo medido. (Funciona porque `time` é singleton em sys.modules:
-      trocar `_walltime.sleep` troca também o `time.sleep` que BBM92.py chama.)
+      divergiria toda a sequência. BBM92.py captura com
+      `stream.startFor(duração_em_ps)`, que informa a duração EXATA pedida
+      (CAPTURE_S), como no driver real (tempo do fluxo de dados). O simulador
+      usa esse valor literal; não há mais interceptação global de `time.sleep`
+      e a simulação conclui a captura sem esperar o tempo real.
 
 Cada processo gera o lote completo (8 canais) e filtra apenas os canais do
 próprio nó (`channels=` do stream). Consequências práticas:
@@ -486,7 +491,7 @@ Desvios "verdadeiros" embutidos no simulador (`_OFFSET_PS`, em ps):
      Bob:    canal 5: -12500  6: -12550  7: -12500  8: -12550
 
 `setInputDelay(ch, delay_ps)` SOMA `delay_ps` aos timestamps do canal quando
-os eventos são lidos (`getEvents`). Em Bob, calibrar com +12500/+12550 cancela
+os eventos são lidos (`getData`). Em Bob, calibrar com +12500/+12550 cancela
 o desvio de ~12,5 ns (sem isso quase não haveria coincidências dentro da janela
 de 800 ps). Em Alice os desvios são pequenos (50 ps) e irrelevantes frente à
 janela (ver observação 16.4). Sem calibrar os canais X de Bob (7 e 8), o sifting
@@ -505,23 +510,34 @@ em `parameter_estimation` com `PostProcessingAbort` nos dois nós.
                                       (timestamps int64 em ps, channels int64),
                                       ordenados.
   configure_link(**kwargs)            recria o enlace padrão `_DEFAULT_LINK`.
-  _SimulatedEvents                    espelha o objeto de getEvents():
-                                      getTimestamps(), getChannels().
-  SimulatedTimeTagger                 setInputDelay(ch, ps), sync() (no-op),
+  SimulatedTimeTagStreamBuffer        espelha o TimeTagStreamBuffer de getData():
+                                      getTimestamps(), getChannels(),
+                                      getEventTypes(), getMissedEvents(),
+                                      atributos size, hasOverflows, tStart,
+                                      tGetData.
+  SimulatedTimeTagger                 setInputDelay(ch, ps), getInputDelay(ch),
+                                      sync() (devolve True), getOverflows(),
+                                      getOverflowsAndClear(), clearOverflows(),
                                       get_input_delays().
-  SimulatedTimeTagStream              start(), stop(), getEvents(). stop() sem
-                                      start() levanta RuntimeError; getEvents()
-                                      antes de stop() também.
-  createTimeTagger(serial=None)       fábrica do tagger simulado.
+  SimulatedTimeTagStream              (tagger, n_max_events, channels); começa a
+                                      acumular na criação, como o real. start(),
+                                      startFor(ps, clear=True), stop(), clear(),
+                                      isRunning(), waitUntilFinished(),
+                                      getCounts(), getData() (esvazia o buffer).
+  TagType, CHANNEL_UNUSED             espelham TimeTagger.TagType / CHANNEL_UNUSED.
+  createTimeTagger(serial="", resolution=0)  fábrica do tagger simulado.
+  freeTimeTagger(tagger)              libera o tagger simulado (no-op).
   install_simulated_hardware(**kw)    registra "Swabian.TimeTagger" em sys.modules
                                       (e reconfigura o enlace se houver kwargs).
   run_bbm92(path, **kw)               instala o simulador e executa BBM92.py via
                                       runpy como __main__.
 
-Comportamento de `getEvents()`: gera o lote; mantém só os canais do stream;
-soma os atrasos configurados; trunca em `buffer_size` eventos (padrão 10
-milhões, algo como ~65 s de captura nos valores padrão, truncamento silencioso);
-reordena por tempo.
+Comportamento de `getData()`: gera o lote correspondente à duração acumulada
+desde a última chamada; mantém só os canais do stream; soma os atrasos
+configurados; reordena por tempo e só então trunca em `n_max_events` eventos
+(padrão 10 milhões, algo como ~65 s de captura nos valores padrão). No driver
+real, `size == n_max_events` indica descarte; BBM92.py emite um warning nesse
+caso. Uma segunda chamada sem nova captura devolve um buffer vazio.
 
 6.8 Linha de comando
 --------------------
@@ -554,17 +570,27 @@ As duas primeiras linhas do arquivo (`import SIMLINK` e
       ValueError("O nó deve ser 'Alice' ou 'Bob'").
 
   calibrate_delays(delays_ps: dict)
-      Para cada (canal, atraso em ps) chama `tagger.setInputDelay`. Serve para
-      compensar diferenças de comprimento de fibra/cabo. Exemplos usados:
+      Para cada (canal, atraso em ps) chama `tagger.setInputDelay(canal,
+      int(round(atraso)))` e, ao final, `tagger.sync()` para garantir que os
+      atrasos já estão ativos. Canais que não pertencem ao nó são ignorados
+      com um warning. Serve para compensar diferenças de comprimento de
+      fibra/cabo. Exemplos usados:
         Alice: {1: 0, 2: 50, 3: 0, 4: 50}
         Bob:   {5: 12500, 6: 12550, 7: 12500, 8: 12550}
 
-  capture_stream(duration_s) -> (timestamps, channels)
-      Cria um `TimeTagStream` (buffer de 10.000.000 eventos, só os 4 canais do
-      nó), chama start(), `tagger.sync()`, dorme `duration_s`, chama stop(),
-      lê os eventos e devolve (timestamps em ps, canais). A duração é a de
-      relógio de parede (time.sleep); a captura de CAPTURE_S segundos leva
-      CAPTURE_S segundos reais.
+  capture_stream(duration_s, n_max_events=10_000_000) -> (timestamps, channels)
+      Cria `TT.TimeTagStream(tagger, n_max_events, canais_do_nó)`, chama
+      `startFor(duração em ps)` e `waitUntilFinished()` (duração medida no
+      tempo do fluxo de dados, sem perder tags ainda em trânsito no pipeline),
+      lê `getData()` e devolve (timestamps em ps, canais) apenas dos eventos
+      `TagType.TimeTag`. Tags de erro/overflow/MissedEvents são descartadas.
+      Emite warning se o buffer encheu (`size >= n_max_events`) ou se houve
+      overflow. Os contadores ficam em `self.last_capture`.
+
+  close()
+      Chama `TT.freeTimeTagger` e libera o dispositivo (idempotente). Também
+      funciona como context manager (`with BBM92HardwareManager(...) as hw:`).
+      ALICE.py/BOB.py chamam close() logo após a captura.
 
 7.2 class BBM92ProtocolEngine
 -----------------------------
@@ -1467,9 +1493,12 @@ simulado; são pontos a conhecer (ou corrigir) antes de evoluir o projeto.
   6. Parâmetros que deixam de valer: seed e pair_rate (só do simulador). A
      exigência de CAPTURE_S igual nos dois nós deixa de ser necessária para a
      correção do sifting, mas ambos devem capturar na mesma janela de tempo.
-  7. Confirme que a versão do driver expõe a mesma API usada (`TimeTagStream`
-     com `start/stop/getEvents`, `getTimestamps`, `getChannels`, `setInputDelay`,
-     `sync`).
+  7. A API usada (`TimeTagStream(tagger, n_max_events, channels)` com
+     `startFor/waitUntilFinished/getData`, `TimeTagStreamBuffer.getTimestamps/
+     getChannels/getEventTypes/getMissedEvents`, `setInputDelay`, `sync`,
+     `getOverflowsAndClear`, `freeTimeTagger`) foi conferida contra o manual e o
+     pacote Swabian-TimeTagger 2.22.6. Ainda não foi validada com um Time Tagger
+     físico; confirme com a sua versão do driver.
   8. Revise o pós-processamento para o seu regime: tamanho de captura, limiar de
      QBER e fração de amostra, e use memória adequada para a etapa de Toeplitz.
 

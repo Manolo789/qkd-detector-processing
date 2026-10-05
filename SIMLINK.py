@@ -8,9 +8,12 @@ pares emaranhados, transmissor e receptores reais.
 Ideia
 -----
 `BBM92.py` importa o driver real com `import Swabian.TimeTagger as TT` e usa
-apenas 4 chamadas desse driver: `createTimeTagger()`, `tagger.setInputDelay()`,
-`tagger.sync()` e `TT.TimeTagStream(...)` (com `.start()`, `.stop()` e
-`.getEvents()`). Este arquivo implementa um módulo Python "Swabian.TimeTagger"
+estas chamadas desse driver: `createTimeTagger()`, `freeTimeTagger()`,
+`tagger.setInputDelay()`, `tagger.sync()`, `tagger.getOverflowsAndClear()` e
+`TT.TimeTagStream(tagger, n_max_events, channels)` (com `.startFor()`,
+`.waitUntilFinished()`, `.stop()` e `.getData()`, que retorna um
+`TimeTagStreamBuffer` com `getTimestamps()`, `getChannels()`,
+`getEventTypes()`, `getMissedEvents()`, `size` e `hasOverflows`). Este arquivo implementa um módulo Python "Swabian.TimeTagger"
 simulado, com essa mesma interface, e o registra em `sys.modules` ANTES de
 `BBM92.py` ser executado. Assim, quando `BBM92.py` faz o `import`, o Python
 encontra nosso backend simulado em vez do driver real — o arquivo BBM92.py
@@ -65,17 +68,16 @@ Ou, de dentro de outro script Python:
 
 Nota sobre calibração de canais
 --------------------------------
-O bloco `__main__` de BBM92.py só chama
-    hw.calibrate_delays({1: 0, 2: 50, 5: 12500, 6: 12550})
-ou seja, só calibra os canais H/V (base Z). Este simulador dá aos canais D/A
-(base X, canais 3, 4, 7 e 8) o MESMO desalinhamento intrínseco de cabeamento
-que H/V. Rodando o exemplo tal como está, portanto, você deve observar: QBER
-baixo e boa contagem de coincidências sifted na base Z, mas coincidências
-quase inexistentes na base X (o desvio de ~12.5 ns nos canais 7/8 cai bem
-fora da janela de 800 ps). Isso ilustra, na prática, por que a etapa de
-calibração de atraso (Seção 3.2.4 da dissertação) é indispensável — para
-corrigir, basta estender a calibração:
-    hw.calibrate_delays({1: 0, 2: 50, 3: 0, 4: 50, 5: 12500, 6: 12550, 7: 12500, 8: 12550})
+Cada nó calibra apenas os SEUS canais (BBM92HardwareManager ignora, com aviso,
+canais de outro nó): ALICE.py chama
+    hw.calibrate_delays({1: 0, 2: 50, 3: 0, 4: 50})
+e BOB.py chama
+    hw.calibrate_delays({5: 12500, 6: 12550, 7: 12500, 8: 12550})
+Este simulador dá aos canais D/A (base X, canais 3, 4, 7 e 8) o MESMO
+desalinhamento intrínseco de cabeamento que H/V. Se algum desses canais não for
+calibrado, quase não haverá coincidências naquela base (um desvio de ~12.5 ns
+cai bem fora da janela de 800 ps) — o que ilustra por que a etapa de
+calibração de atraso (Seção 3.2.4 da dissertação) é indispensável.
 """
 
 from __future__ import annotations
@@ -88,59 +90,15 @@ import types
 
 import numpy as np
 
-# =============================================================================
-# 0. Interceptação de time.sleep para permitir reprodutibilidade ENTRE
-#    PROCESSOS (correção de bug crítico)
-# =============================================================================
-# ALICE.py e BOB.py rodam em computadores separados. Cada processo cria seu
-# próprio `_DEFAULT_LINK` com a MESMA seed (42) -- essa é claramente a forma
-# como o autor original pretendia fazer os dois lados "enxergarem" o mesmo
-# enlace emaranhado simulado sem nenhum estado realmente compartilhado entre
-# as máquinas: se as duas instâncias de SimulatedEntangledLink recebem a
-# mesma seed E o mesmo argumento `duration_s` em generate(), os dois
-# processos sorteiam, de forma totalmente determinística, os MESMOS pares
-# (mesmos tempos de criação, mesmas bases, mesmos bits) -- e cada lado só
-# fica com os canais que lhe pertencem.
-#
-# O problema: BBM92HardwareManager.capture_stream() mede a duração pelo
-# relógio de parede (time.sleep(duration_s) seguido de
-# tempo_final - tempo_inicial), e essa duração MEDIDA nunca é exatamente
-# igual entre dois computadores (jitter do agendador do SO, carga da
-# máquina, etc.). Uma diferença de microssegundos já é suficiente para que
-# rng.poisson(pair_rate_hz * duration_s) sorteie um número de pares
-# diferente em cada lado, o que diverge TODA a sequência aleatória seguinte.
-# Resultado: Alice e Bob geram fótons simulados totalmente descorrelacionados
-# entre si, a etapa de coincidência (perform_sifting) não encontra pares
-# reais, e o QBER calculado sobre um conjunto vazio é reportado como 0%
-# ("sucesso" falso) mesmo com uma chave final de 0 bits.
-#
-# Correção (sem tocar em BBM92.py, que deve continuar rodando linha por linha
-# como com o driver real): interceptamos a chamada `time.sleep(duration_s)`
-# feita dentro de capture_stream() e guardamos o valor literal pedido;
-# TimeTagStream.stop() usa esse valor exato em vez do tempo medido. Como
-# ALICE.py e BOB.py pedem literalmente o mesmo `duration_s` (ex.: 0.001),
-# essa correção restaura a reprodutibilidade bit-a-bit entre os dois
-# processos.
-# NOTA: `_walltime` É o módulo `time` (importado acima como `import time as
-# _walltime`). BBM92.py faz `import time; time.sleep(duration_s)` dentro de
-# capture_stream() -- como módulos Python são singletons em sys.modules,
-# `_walltime` e o `time` que BBM92.py importa são o MESMO objeto de módulo,
-# então corrigir `_walltime.sleep` também corrige o `time.sleep` que
-# BBM92.py chama, sem precisar tocar em BBM92.py.
-_real_sleep = _walltime.sleep
-_last_requested_sleep_s: float | None = None
-
-
-def _recording_sleep(seconds: float) -> None:
-    """Substitui time.sleep: grava a duração pedida e realmente dorme por ela
-    (mantém o comportamento/tempo real do programa, só adiciona o registro)."""
-    global _last_requested_sleep_s
-    _last_requested_sleep_s = float(seconds)
-    _real_sleep(seconds)
-
-
-_walltime.sleep = _recording_sleep
-
+# NOTA sobre reprodutibilidade entre processos
+# --------------------------------------------
+# ALICE.py e BOB.py rodam em computadores separados e cada processo cria seu
+# próprio `_DEFAULT_LINK` com a MESMA seed. Se os dois pedirem a MESMA duração
+# em generate(), sorteiam exatamente os mesmos pares (cada lado fica só com os
+# seus canais). BBM92.py agora captura com `stream.startFor(duração_em_ps)`, que
+# informa a duração EXATA pedida (como no driver real, onde ela é medida no
+# tempo do fluxo de dados). Por isso não é mais necessário interceptar
+# `time.sleep` globalmente, como era feito quando a captura usava sleep()+stop().
 
 # =============================================================================
 # 1. Constantes de canal — devem espelhar exatamente BBM92.py
@@ -328,14 +286,33 @@ def configure_link(**kwargs) -> SimulatedEntangledLink:
 
 
 # =============================================================================
-# 3. Backend simulado "Swabian.TimeTagger" — mesma interface usada por BBM92.py
+# 3. Backend simulado "Swabian.TimeTagger" — espelha a API real (manual 2.22.6)
 # =============================================================================
-class _SimulatedEvents:
-    """Espelha o objeto retornado por stream.getEvents() na API real."""
+CHANNEL_UNUSED = -134217728  # igual a TimeTagger.CHANNEL_UNUSED
 
-    def __init__(self, timestamps: np.ndarray, channels: np.ndarray):
-        self._timestamps = timestamps
-        self._channels = channels
+
+class TagType(int):
+    """Espelha TimeTagger.TagType (valores inteiros iguais aos do driver real)."""
+
+
+TagType.TimeTag = TagType(0)
+TagType.Error = TagType(1)
+TagType.OverflowBegin = TagType(2)
+TagType.OverflowEnd = TagType(3)
+TagType.MissedEvents = TagType(4)
+
+
+class SimulatedTimeTagStreamBuffer:
+    """Espelha TimeTagStreamBuffer, retornado por TimeTagStream.getData()."""
+
+    def __init__(self, timestamps: np.ndarray, channels: np.ndarray,
+                 t_start: int = 0, t_get_data: int = 0):
+        self._timestamps = np.asarray(timestamps, dtype=np.int64)
+        self._channels = np.asarray(channels, dtype=np.int32)
+        self.size = int(len(self._timestamps))   # atributo, como no driver real
+        self.hasOverflows = False
+        self.tStart = int(t_start)
+        self.tGetData = int(t_get_data)
 
     def getTimestamps(self) -> np.ndarray:
         return self._timestamps
@@ -343,21 +320,41 @@ class _SimulatedEvents:
     def getChannels(self) -> np.ndarray:
         return self._channels
 
+    def getEventTypes(self) -> np.ndarray:
+        # A simulação só produz detecções reais (TagType.TimeTag).
+        return np.zeros(self.size, dtype=np.uint8)
+
+    def getMissedEvents(self) -> np.ndarray:
+        return np.zeros(self.size, dtype=np.uint16)
+
 
 class SimulatedTimeTagger:
-    """Substitui TT.createTimeTagger(...) — mesma interface mínima usada."""
+    """Substitui TT.createTimeTagger(...): mesma interface usada pelo projeto."""
 
-    def __init__(self, serial_number: str | None = None, link: SimulatedEntangledLink | None = None):
-        self.serial_number = serial_number or "SIM-TT-8CH-0001"
+    def __init__(self, serial: str = "", link: SimulatedEntangledLink | None = None):
+        self.serial_number = serial or "SIM-TT-8CH-0001"
         self._input_delays: dict[int, int] = {}
         self._link = link if link is not None else _DEFAULT_LINK
+        self._freed = False
 
-    def setInputDelay(self, channel: int, delay_ps: int) -> None:
-        """Compensa (aditivamente) o atraso de cabeamento/eletrônica de um canal."""
-        self._input_delays[int(channel)] = int(delay_ps)
+    def setInputDelay(self, channel: int, delay: int) -> None:
+        """Atraso artificial (ps, int) somado aos timestamps do canal."""
+        self._input_delays[int(channel)] = int(delay)
 
-    def sync(self) -> None:
-        """No hardware real, alinha domínios de clock internos; aqui é um no-op."""
+    def getInputDelay(self, channel: int) -> int:
+        return self._input_delays.get(int(channel), 0)
+
+    def sync(self, timeout: int = -1) -> bool:
+        """No hardware real, aguarda o pipeline/FPGA; aqui retorna True imediatamente."""
+        return True
+
+    def getOverflows(self) -> int:
+        return 0
+
+    def getOverflowsAndClear(self) -> int:
+        return 0
+
+    def clearOverflows(self) -> None:
         return None
 
     def get_input_delays(self) -> dict:
@@ -365,70 +362,107 @@ class SimulatedTimeTagger:
 
 
 class SimulatedTimeTagStream:
-    """Substitui TT.TimeTagStream(tagger, buffer_size, channels)."""
+    """
+    Substitui TT.TimeTagStream(tagger, n_max_events, channels).
 
-    def __init__(self, tagger: SimulatedTimeTagger, buffer_size: int = 10_000_000, channels=None):
+    Como no driver real, a medição começa a acumular dados já na criação do
+    objeto; getData() devolve o que foi acumulado desde a última chamada e
+    esvazia o buffer.
+    """
+
+    def __init__(self, tagger: SimulatedTimeTagger, n_max_events: int, channels):
         self.tagger = tagger
-        self.buffer_size = int(buffer_size)
-        self.channels = list(channels) if channels else []
-        self._running = False
-        self._t0_wall = None
-        self._duration_s = 0.0
-
-    def start(self) -> None:
+        self.n_max_events = int(n_max_events)
+        self.channels = list(channels)
         self._running = True
         self._t0_wall = _walltime.time()
-        global _last_requested_sleep_s
-        _last_requested_sleep_s = None
+        self._pending_s = 0.0     # duração acumulada ainda não lida por getData()
+        self._elapsed_ps = 0      # tempo total do fluxo, para tStart/tGetData
+        self._last_get_ps = 0
 
-    def stop(self) -> None:
+    # -- controle da medição ---------------------------------------------
+    def start(self) -> None:
         if not self._running:
-            raise RuntimeError("TimeTagStream.stop() chamado sem um start() correspondente.")
-        medido = _walltime.time() - self._t0_wall
-        if _last_requested_sleep_s is not None:
-            # Usa a duração literal pedida via time.sleep(...) entre start()/
-            # stop() -- garante que dois processos independentes (Alice e
-            # Bob, em computadores diferentes) com a mesma seed sorteiem
-            # exatamente os mesmos pares simulados. Ver nota no topo do
-            # arquivo sobre por que o tempo medido não serve para isso.
-            self._duration_s = _last_requested_sleep_s
-        else:
-            # Nenhum time.sleep() foi observado entre start() e stop() (uso
-            # fora do padrão de BBM92HardwareManager.capture_stream) -- cai de
-            # volta para o tempo medido.
-            self._duration_s = medido
+            self._running = True
+            self._t0_wall = _walltime.time()
+
+    def startFor(self, capture_duration: int, clear: bool = True) -> None:
+        """Captura por `capture_duration` ps. A duração é EXATA (determinística)."""
+        if clear:
+            self.clear()
+        self._pending_s += float(capture_duration) / 1e12
+        self._elapsed_ps += int(capture_duration)
         self._running = False
 
-    def getEvents(self) -> _SimulatedEvents:
+    def stop(self) -> None:
         if self._running:
-            raise RuntimeError("Chame stop() antes de ler os eventos do buffer.")
+            self._accumulate_wall()
+            self._running = False
 
-        timestamps, channels = self.tagger._link.generate(self._duration_s)
+    def clear(self) -> None:
+        self._pending_s = 0.0
+
+    def isRunning(self) -> bool:
+        return self._running
+
+    def waitUntilFinished(self, timeout: int = -1) -> bool:
+        # A simulação conclui startFor() instantaneamente.
+        return not self._running
+
+    def getCounts(self) -> int:
+        return len(self._build()[0])
+
+    # -- leitura -------------------------------------------------------------
+    def _accumulate_wall(self) -> None:
+        medido = _walltime.time() - self._t0_wall
+        self._pending_s += medido
+        self._elapsed_ps += int(medido * 1e12)
+        self._t0_wall = _walltime.time()
+
+    def _build(self):
+        if self._pending_s <= 0:
+            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+        timestamps, channels = self.tagger._link.generate(self._pending_s)
 
         # Mantém somente os canais configurados no stream, como no hardware real
         if self.channels:
             mask = np.isin(channels, self.channels)
             timestamps, channels = timestamps[mask], channels[mask]
 
-        # Aplica a calibração de atraso definida via tagger.setInputDelay(...)
+        # Aplica a calibração definida via tagger.setInputDelay(...)
         delays = self.tagger.get_input_delays()
         if delays:
             timestamps = timestamps.copy()
             for ch, delay_ps in delays.items():
                 timestamps[channels == ch] += delay_ps
 
-        # Respeita o tamanho de buffer configurado, como no hardware real
-        if len(timestamps) > self.buffer_size:
-            timestamps = timestamps[: self.buffer_size]
-            channels = channels[: self.buffer_size]
-
+        # O hardware entrega as tags em ordem temporal; só então o buffer corta.
         order = np.argsort(timestamps, kind="stable")
-        return _SimulatedEvents(timestamps[order], channels[order])
+        timestamps, channels = timestamps[order], channels[order]
+        if len(timestamps) > self.n_max_events:
+            timestamps = timestamps[: self.n_max_events]
+            channels = channels[: self.n_max_events]
+        return timestamps, channels
+
+    def getData(self) -> SimulatedTimeTagStreamBuffer:
+        if self._running:
+            self._accumulate_wall()
+        timestamps, channels = self._build()
+        buf = SimulatedTimeTagStreamBuffer(
+            timestamps, channels, t_start=self._last_get_ps, t_get_data=self._elapsed_ps)
+        self._last_get_ps = self._elapsed_ps
+        self._pending_s = 0.0   # esvazia o buffer: cada tag é entregue uma só vez
+        return buf
 
 
-def createTimeTagger(serial_number: str | None = None) -> SimulatedTimeTagger:
-    """Substitui TT.createTimeTagger(serial_number)."""
-    return SimulatedTimeTagger(serial_number=serial_number, link=_DEFAULT_LINK)
+def createTimeTagger(serial: str = "", resolution: int = 0) -> SimulatedTimeTagger:
+    """Substitui TT.createTimeTagger(serial="", resolution=Standard)."""
+    return SimulatedTimeTagger(serial=serial, link=_DEFAULT_LINK)
+
+
+def freeTimeTagger(tagger: SimulatedTimeTagger) -> None:
+    """Substitui TT.freeTimeTagger(tagger)."""
+    tagger._freed = True
 
 
 def install_simulated_hardware(**link_kwargs) -> None:
@@ -444,7 +478,10 @@ def install_simulated_hardware(**link_kwargs) -> None:
     swabian_pkg = types.ModuleType("Swabian")
     tt_mod = types.ModuleType("Swabian.TimeTagger")
     tt_mod.createTimeTagger = createTimeTagger
+    tt_mod.freeTimeTagger = freeTimeTagger
     tt_mod.TimeTagStream = SimulatedTimeTagStream
+    tt_mod.TagType = TagType
+    tt_mod.CHANNEL_UNUSED = CHANNEL_UNUSED
     tt_mod.configure_link = configure_link
     tt_mod.SimulatedEntangledLink = SimulatedEntangledLink
 
