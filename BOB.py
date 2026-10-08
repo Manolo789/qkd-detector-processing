@@ -1,6 +1,5 @@
 import json
 import os
-import numpy as np
 from BBM92 import BBM92HardwareManager, BBM92ProtocolEngine
 from CLASSIC_CHANNEL import BobClassicalChannel
 from AUXILIARY import AuthKeyPool, ClassicalLink, PostProcessingError
@@ -9,8 +8,10 @@ from POSTPROCESS import run_postprocessing
 # --- Configuração do pós-processamento (deve ser IGUAL à de ALICE.py) ---
 EC_METHOD = os.environ.get("EC_METHOD", "cascade")
 AUTH_KEY_FILE = os.environ.get("AUTH_KEY_FILE", "auth_key.json")
-CAPTURE_S = float(os.environ.get("CAPTURE_S", "0.01"))       # duração da captura (s); IGUAL em Alice e Bob
+CAPTURE_S = float(os.environ.get("CAPTURE_S", "2"))       # duração da captura (s); IGUAL em Alice e Bob
 CLASSIC_PORT = int(os.environ.get("CLASSIC_PORT", "65432"))   # ÚNICA porta TCP (sifting + pós-processamento); IGUAL em Alice e Bob
+SLOT_PS = int(os.environ.get("SLOT_PS", "800"))              # largura do slot de coincidência (ps); IGUAL em Alice e Bob
+
 
 # Utilizar apenas no teste de hardware simulado
 #import SIMLINK
@@ -39,28 +40,28 @@ def main():
         finally:
             hw.close()  # libera o Time Tagger (freeTimeTagger); só a captura usa o hardware
 
-        engine = BBM92ProtocolEngine(coincidence_window_ps=800)
+        engine = BBM92ProtocolEngine(slot_ps=SLOT_PS)
         key, sifted_len = engine.process_time_tags(timestamps, channels)
         print(f"[BOB] Chave gerada (não peneirada): {sifted_len} bits adquiridos.")
 
-        dados_bases_bob = {
-            "ts": engine.valid_ts.tolist(),
-            "bases": engine.bases.tolist()
-        }
+        # Só índices de slot + código da base (1 = retilínea, 2 = diagonal):
+        # os timestamps finos NÃO são enviados (vazariam o valor do bit).
+        dados_bases_bob = engine.announcement()
 
         # Troca de bases (sifting) pela conexão persistente
         print("[BOB] Trocando BASES (Sifting) via canal clássico...")
         msg_alice = channel.exchange(json.dumps(dados_bases_bob))
-        dados_alice = json.loads(msg_alice)
-
-        ts_alice = np.array(dados_alice["ts"])
-        bases_alice = np.array(dados_alice["bases"])
-
-        sifted_key, final_sifted_len = engine.perform_sifting(key, ts_alice, bases_alice, is_bob=True)
+        try:
+            dados_alice = json.loads(msg_alice)
+    
+            sifted_key, final_sifted_len = engine.perform_sifting(key, dados_alice, is_bob=True)
+        except ValueError as exc:
+            print(f"[BOB][ABORTADO] Sifting inválido: {exc}")
+            return
         if final_sifted_len == 0:
             print("[BOB][ERRO] Nenhuma coincidência foi encontrada entre Alice e "
                   "Bob. Verifique a conectividade de rede (host/porta) e se os "
-                  "dois processos usam a mesma seed/duração de captura. "
+                  "dois processos usam a mesma seed/duração de captura/SLOT_PS. "
                   "Encerrando sem gerar chave.")
             return
         print(f"Chave bruta: {key} bits")
@@ -70,7 +71,7 @@ def main():
         # PE (QBER) -> correção de erros -> privacy amplification -> autenticação,
         # tudo na MESMA conexão TCP do sifting.
         link = ClassicalLink(role="bob", channel=channel)
-        # As bases/timestamps trocados no sifting também entram na transcrição autenticada
+        # Os índices de slot/bases trocados no sifting também entram na transcrição autenticada
         # (mesma ordem de Alice: primeiro a mensagem de Alice, depois a de Bob):
         link.record(alice_msg=msg_alice, bob_msg=json.dumps(dados_bases_bob))
         pool = AuthKeyPool.load(AUTH_KEY_FILE)

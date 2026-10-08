@@ -133,68 +133,157 @@ class BBM92HardwareManager:
 
 
 class BBM92ProtocolEngine:
-    """Motor do protocolo BBM92 para sifting, mapeamento e cálculo do QBER."""
-    def __init__(self, coincidence_window_ps: int = 1000):
-        self.window = coincidence_window_ps  # Janela de coincidência (ex: 1000 ps = 1 ns)
-        
+    """
+    Motor do protocolo BBM92 para mapeamento, sifting e cálculo do QBER.
+
+    Sifting por ÍNDICE DE SLOT (sem timestamps na rede)
+    ---------------------------------------------------
+    Cada nó divide a sua linha do tempo (já calibrada, na base de tempo comum)
+    em slots de largura fixa `slot_ps` e anuncia, para cada slot em que houve
+    detecção, apenas:
+
+        * o índice do slot:  k = floor(t / slot_ps)
+        * o código da base:  1 = retilínea (Z: H/V)   2 = diagonal (X: D/A)
+
+    O instante fino da detecção (resolução de ps) NUNCA sai do nó. Antes, os
+    timestamps brutos de Alice e Bob eram publicados; com os dois, um espião
+    calculava t_Alice - t_Bob de cada par e, como cada detector tem atraso e
+    jitter próprios (resíduo de calibração), podia inferir qual detector
+    disparou, isto é, o VALOR do bit (canal lateral temporal; Lamas-Linares
+    e Kurtsiefer, Opt. Express 15, 9388, 2007). Com índices de slot, a posição
+    da detecção dentro do slot fica oculta.
+
+    Coincidência = mesmo índice de slot nos dois nós. Pares cujo atraso
+    relativo os faz cair em slots vizinhos são perdidos (fração ~E|dt|/slot_ps,
+    cerca de 10% com jitter de 350 ps FWHM e slot de 1600 ps). Esses pares
+    são descartados nos dois lados e não entram na chave.
+
+    Se um nó tiver mais de uma detecção no mesmo slot (clique múltiplo,
+    dark count ou coincidência acidental), só a mais antiga é usada, como na
+    varredura de dois ponteiros anterior. O número de slots com várias
+    detecções fica em `self.n_multi_click` (local, não é anunciado).
+    """
+
+    BASIS_CODE = {'Z': 1, 'X': 2}          # 1 = retilínea (H/V), 2 = diagonal (D/A)
+    CODE_BASIS = {1: 'Z', 2: 'X'}
+
+    def __init__(self, coincidence_window_ps: int = 1000, slot_ps: int = None):
+        # `coincidence_window_ps` é mantido por compatibilidade: a janela antiga
+        # aceitava |dt| <= janela, ou seja, uma largura total de 2 x janela.
+        # O slot padrão tem essa mesma largura, o que mantém a taxa de
+        # coincidências acidentais aproximadamente igual.
+        self.window = int(coincidence_window_ps)
+        self.slot_ps = int(slot_ps) if slot_ps else 2 * self.window
+        if self.slot_ps <= 0:
+            raise ValueError("slot_ps deve ser um inteiro positivo (picossegundos).")
+
         # Mapeamento de canais para base (Z ou X) e valor de bit
-        # Base Z = 0, Base X = 1
         self.channel_map = {
             1: ('Z', 0), 2: ('Z', 1), 3: ('X', 0), 4: ('X', 1),  # Alice
             5: ('Z', 0), 6: ('Z', 1), 7: ('X', 0), 8: ('X', 1)   # Bob
         }
-        # Propriedades para salvar os estados pós-medição
-        self.valid_ts = np.array([])
-        self.bases = np.array([])
+        self._known_channels = np.array(sorted(self.channel_map), dtype=np.int64)
+        lut_size = int(self._known_channels.max()) + 1
+        self._lut_code = np.zeros(lut_size, dtype=np.uint8)
+        self._lut_bit = np.zeros(lut_size, dtype=np.uint8)
+        for ch, (base, bit) in self.channel_map.items():
+            self._lut_code[ch] = self.BASIS_CODE[base]
+            self._lut_bit[ch] = bit
 
-
+        # Estado local pós-medição (um elemento por slot ocupado).
+        # NADA disto além de `slots` e `basis_codes` pode ir para a rede.
+        self.slots = np.array([], dtype=np.int64)        # índices de slot (crescentes)
+        self.basis_codes = np.array([], dtype=np.uint8)  # 1 ou 2 por slot
+        self.bases = np.array([])                        # 'Z'/'X' por slot (compatibilidade)
+        self.n_detections = 0
+        self.n_multi_click = 0
+        self.n_coincidences = 0
 
     def process_time_tags(self, timestamps, channels):
-        """Extrai a chave bruta gerada e armazena bases e tempos locais para sifting."""
-        raw_key = []
-        bases = []
-        valid_ts = []
-        
-        for t, c in zip(timestamps, channels):
-            if c in self.channel_map:
-                base, bit = self.channel_map[c]
-                raw_key.append(bit)
-                bases.append(base)
-                valid_ts.append(t)
-                
-        self.valid_ts = np.array(valid_ts)
-        self.bases = np.array(bases)
-        
-        key = np.array(raw_key)
-        sifted_len = len(key)
-        return key, sifted_len
+        """
+        Converte as detecções locais em (bit, base, índice de slot).
 
-    def perform_sifting(self, local_key, remote_ts, remote_bases, is_bob=False):
+        Retorna (key, n): o bit de cada slot ocupado (detecção mais antiga do
+        slot) e o número de slots. Guarda `slots`, `basis_codes` e `bases`.
         """
-        Alinha temporalmente os eventos locais e remotos.
-        Gera a chave peneirada comparando as bases, sem que os bits transitem na rede.
+        ts = np.asarray(timestamps, dtype=np.int64).ravel()
+        ch = np.asarray(channels, dtype=np.int64).ravel()
+        if ts.shape != ch.shape:
+            raise ValueError("timestamps e channels devem ter o mesmo tamanho.")
+
+        keep = np.isin(ch, self._known_channels)
+        ts, ch = ts[keep], ch[keep]
+        order = np.argsort(ts, kind="stable")
+        ts, ch = ts[order], ch[order]
+
+        slots = np.floor_divide(ts, self.slot_ps)
+        # `first` = posição da 1ª (mais antiga) detecção de cada slot
+        uniq, first = np.unique(slots, return_index=True)
+        sel = ch[first]
+
+        self.slots = uniq.astype(np.int64)
+        self.basis_codes = self._lut_code[sel]
+        self.bases = np.where(self.basis_codes == 1, 'Z', 'X')
+        self.n_detections = int(len(ts))
+        self.n_multi_click = int(len(ts) - len(uniq))
+
+        key = self._lut_bit[sel]
+        return key, len(key)
+
+    def announcement(self) -> dict:
         """
-        sifted_key = []
-        i, j = 0, 0
-        len_local = len(self.valid_ts)
-        len_remote = len(remote_ts)
-        
-        while i < len_local and j < len_remote:
-            diff = self.valid_ts[i] - remote_ts[j]
-            if abs(diff) <= self.window:
-                if self.bases[i] == remote_bases[j]:
-                    if is_bob:
-                        sifted_key.append(1 - local_key[i])
-                    else:
-                        sifted_key.append(local_key[i])
-                i += 1
-                j += 1
-            elif self.valid_ts[i] < remote_ts[j]:
-                i += 1
-            else:
-                j += 1
-                
-        return np.array(sifted_key), len(sifted_key)
+        Mensagem pública do sifting: índices de slot e códigos de base.
+        Formato: {"slot_ps": int, "idx": [k, ...], "bases": "1212..."}.
+        """
+        codes = (self.basis_codes.astype(np.uint8) + ord('0')).tobytes().decode("ascii")
+        return {"slot_ps": self.slot_ps, "idx": self.slots.tolist(), "bases": codes}
+
+    def _parse_announcement(self, remote):
+        """Valida a mensagem do outro nó e devolve (índices, códigos)."""
+        if not isinstance(remote, dict) or not {"slot_ps", "idx", "bases"} <= remote.keys():
+            raise ValueError("Mensagem de sifting malformada: esperado "
+                             "{'slot_ps', 'idx', 'bases'}.")
+        if int(remote["slot_ps"]) != self.slot_ps:
+            raise ValueError(f"Largura de slot diferente entre os nós "
+                             f"(local={self.slot_ps} ps, remoto={remote['slot_ps']} ps). "
+                             f"Use o mesmo SLOT_PS em Alice e Bob.")
+        idx = np.asarray(remote["idx"], dtype=np.int64).ravel()
+        codes = np.frombuffer(str(remote["bases"]).encode("ascii"), dtype=np.uint8) - ord('0')
+        if len(idx) != len(codes):
+            raise ValueError(f"Mensagem de sifting inconsistente: {len(idx)} índices "
+                             f"e {len(codes)} códigos de base.")
+        if len(codes) and not np.all((codes == 1) | (codes == 2)):
+            raise ValueError("Código de base inválido (esperado 1 = retilínea ou 2 = diagonal).")
+        if len(idx) > 1 and not np.all(np.diff(idx) > 0):
+            raise ValueError("Índices de slot remotos devem ser estritamente crescentes.")
+        return idx, codes
+
+    def perform_sifting(self, local_key, remote, is_bob=False):
+        """
+        Peneiramento por índice de slot.
+
+        `remote` é a mensagem do outro nó (dict de `announcement()`). Um slot
+        ocupado nos DOIS nós é uma coincidência; se os códigos de base forem
+        iguais, o bit local entra na chave peneirada (em Bob, invertido:
+        1 - bit, por causa da anticorrelação do singleto). Os slots comuns são
+        percorridos em ordem crescente nos dois lados, então as chaves saem
+        alinhadas. Os bits nunca transitam na rede.
+
+        Levanta ValueError se a mensagem remota for inválida.
+        """
+        local_key = np.asarray(local_key, dtype=np.uint8).ravel()
+        if len(local_key) != len(self.slots):
+            raise ValueError("local_key deve ser o vetor devolvido por process_time_tags.")
+        r_idx, r_codes = self._parse_announcement(remote)
+
+        _, li, ri = np.intersect1d(self.slots, r_idx, assume_unique=True,
+                                   return_indices=True)
+        self.n_coincidences = int(len(li))
+        same_basis = self.basis_codes[li] == r_codes[ri]
+        sifted_key = local_key[li[same_basis]]
+        if is_bob:
+            sifted_key = 1 - sifted_key
+        return sifted_key.astype(np.uint8), int(len(sifted_key))
 
     def calculate_qber(self, qber_bits_a, qber_bits_b):
         """Calcula o QBER baseando-se apenas no subconjunto de bits revelados."""

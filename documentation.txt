@@ -82,8 +82,9 @@ A cadeia é:
 Uma fonte emite pares de fótons emaranhados no estado singleto |Psi->. Um fóton
 vai para Alice e outro para Bob. Cada um, independentemente e ao acaso, mede
 na base Z (polarizações H/V) ou na base X (polarizações D/A). Depois, por um
-canal clássico público (autenticado), eles comparam apenas as BASES usadas (e
-os instantes das detecções), nunca os bits:
+canal clássico público (autenticado), eles comparam apenas as BASES usadas e
+o ÍNDICE DO SLOT de tempo de cada detecção (nunca os bits nem os timestamps
+finos; ver 7.4):
 
   * bases iguais    -> o resultado de Bob é ANTICORRELACIONADO com o de Alice
                        (por isso Bob inverte seus bits no sifting);
@@ -271,6 +272,9 @@ partir do mesmo conteúdo e da mesma posição (`pos`).
   CAPTURE_S     0.01             Alice, Bob   Duração da captura em segundos.
                                               DEVE ser igual nos dois nós.
   CLASSIC_PORT  65432            Alice, Bob   Porta TCP única. DEVE ser igual.
+  SLOT_PS       1600             Alice, Bob   Largura do slot de coincidência
+                                              (ps). DEVE ser igual; se diferir,
+                                              os dois nós abortam no sifting.
   ALICE_HOST    (vazio)          só Bob       IP de Alice. Obrigatória em Bob.
 
 ATENÇÃO ao padrão de CAPTURE_S: com 0,01 s a simulação produz apenas ~15 bits
@@ -288,7 +292,9 @@ alguns segundos (seção 14):
          eve_intercept_resend=False, seed=42)`: taxa de pares, presença de
          espiã e semente da simulação. Mude `eve_intercept_resend=True`
          em AMBOS para demonstrar a detecção de espionagem.
-      - Janela de coincidência: `BBM92ProtocolEngine(coincidence_window_ps=800)`.
+      - Slot de coincidência: `BBM92ProtocolEngine(slot_ps=SLOT_PS)` (variável
+        de ambiente SLOT_PS, padrão 1600 ps = largura total da antiga janela
+        de +-800 ps).
       - Atrasos de calibração: `hw.calibrate_delays({...})` (valores
         diferentes por nó, ver 11.2).
   * Em `run_postprocessing(...)`, não expostos por variável de ambiente:
@@ -326,9 +332,9 @@ real o número difere porque inclui a troca de sifting e depende do QBER.)
         calibrate_delays(...)                             calibrate_delays(...)
         capture_stream(CAPTURE_S)                         capture_stream(CAPTURE_S)
         process_time_tags -> bits brutos,                 process_time_tags -> bits brutos,
-        timestamps e bases locais                         timestamps e bases locais
+        índices de slot e bases locais                    índices de slot e bases locais
 
-  F2    SIFTING: troca {"ts":[...], "bases":[...]} ------ (mensagem de Bob)
+  F2    SIFTING: troca {"slot_ps", "idx", "bases"} ------ (mensagem de Bob)
         perform_sifting(is_bob=False)                     perform_sifting(is_bob=True)
         (se 0 coincidências: aborta com erro)             (se 0 coincidências: aborta com erro)
 
@@ -491,11 +497,19 @@ Desvios "verdadeiros" embutidos no simulador (`_OFFSET_PS`, em ps):
      Bob:    canal 5: -12500  6: -12550  7: -12500  8: -12550
 
 `setInputDelay(ch, delay_ps)` SOMA `delay_ps` aos timestamps do canal quando
-os eventos são lidos (`getData`). Em Bob, calibrar com +12500/+12550 cancela
-o desvio de ~12,5 ns (sem isso quase não haveria coincidências dentro da janela
-de 800 ps). Em Alice os desvios são pequenos (50 ps) e irrelevantes frente à
-janela (ver observação 16.4). Sem calibrar os canais X de Bob (7 e 8), o sifting
-perderia praticamente toda a base X.
+os eventos são lidos (`getData`). Portanto o atraso de calibração de cada canal
+é o NEGATIVO do seu desvio: atraso = -desvio. Em Bob, +12500/+12550 cancelam
+os desvios de -12500/-12550 (sem isso quase não haveria coincidências dentro
+do slot). Em Alice, -50 ps nos canais 2 e 4 cancelam os desvios de +50 ps.
+Os desvios de Alice são pequenos para a TAXA de coincidências, mas não para a
+segurança: um resíduo entre detectores do mesmo nó torna o instante da
+detecção dependente do bit (ver 7.4 e 16.4). Sem calibrar os canais X de Bob
+(7 e 8), o sifting perderia praticamente toda a base X.
+
+Desvio médio t_Alice - t_Bob por detector de Alice, medido no simulador (1 s,
+seed 5, pares de mesma base):
+     calibração antiga {2: +50, 4: +50}:  canais 2 e 4 ~ +100 ps
+     calibração atual  {2: -50, 4: -50}:  todos os canais entre -1 e +5 ps
 
 6.6 Espiã (intercept-resend)
 ----------------------------
@@ -575,7 +589,7 @@ As duas primeiras linhas do arquivo (`import SIMLINK` e
       atrasos já estão ativos. Canais que não pertencem ao nó são ignorados
       com um warning. Serve para compensar diferenças de comprimento de
       fibra/cabo. Exemplos usados:
-        Alice: {1: 0, 2: 50, 3: 0, 4: 50}
+        Alice: {1: 0, 2: -50, 3: 0, 4: -50}
         Bob:   {5: 12500, 6: 12550, 7: 12500, 8: 12550}
 
   capture_stream(duration_s, n_max_events=10_000_000) -> (timestamps, channels)
@@ -594,33 +608,44 @@ As duas primeiras linhas do arquivo (`import SIMLINK` e
 
 7.2 class BBM92ProtocolEngine
 -----------------------------
-  __init__(coincidence_window_ps=1000)
-      Guarda a janela de coincidência (ALICE.py e BOB.py usam 800 ps),
-      o `channel_map` {canal: (base, bit)} e os atributos `valid_ts`
-      e `bases` (preenchidos por process_time_tags).
+  BASIS_CODE = {'Z': 1, 'X': 2}
+      Código público da base: 1 = retilínea (H/V), 2 = diagonal (D/A).
+
+  __init__(coincidence_window_ps=1000, slot_ps=None)
+      Guarda a largura do slot de coincidência. Sem `slot_ps`, usa
+      2 x coincidence_window_ps (a largura total da antiga janela +-janela).
+      ALICE.py e BOB.py passam `slot_ps=SLOT_PS` (padrão 1600 ps). Monta o
+      `channel_map` {canal: (base, bit)} e tabelas de consulta vetorizadas.
 
   process_time_tags(timestamps, channels) -> (key, n)
-      Percorre os eventos; para cada canal conhecido registra:
-        key[i]      = bit do canal (0 ou 1)
-        bases[i]    = 'Z' ou 'X'
-        valid_ts[i] = timestamp
-      Ainda não há peneiramento: são TODAS as detecções do nó (incluindo
-      fótons sem par e dark counts). Retorna o vetor de bits e seu tamanho.
-      Também guarda `valid_ts` e `bases` em `self`.
+      Descarta canais desconhecidos, ordena por tempo e calcula o índice de
+      slot de cada detecção, k = floor(t / slot_ps). Para cada slot ocupado
+      fica a detecção MAIS ANTIGA:
+        key[i]         = bit do canal (0 ou 1)
+        slots[i]       = índice do slot (crescente)
+        basis_codes[i] = 1 ou 2   (e bases[i] = 'Z' ou 'X', compatibilidade)
+      Ainda não há peneiramento: são todos os slots ocupados do nó
+      (incluindo fótons sem par e dark counts). Slots com mais de uma
+      detecção são contados em `n_multi_click` (dado local, não anunciado).
+      Vetorizado com NumPy.
 
-  perform_sifting(local_key, remote_ts, remote_bases, is_bob=False)
-      Alinha no tempo os eventos locais e remotos com uma varredura de dois
-      ponteiros (i local, j remoto), em O(n_local + n_remote):
-        - se |ts_local[i] - ts_remoto[j]| <= janela: é uma coincidência;
-            * se as bases forem iguais, o bit local entra na chave peneirada
-              (em Bob, INVERTIDO: 1 - bit, por causa da anticorrelação do
-              singleto);
-            * i e j avançam juntos (casamento 1-para-1, guloso);
-        - caso contrário avança o ponteiro do evento mais antigo.
-      Retorna (chave peneirada como np.array, comprimento). Os bits nunca
-      trafegam pela rede, apenas timestamps e bases. A varredura é simétrica,
-      então Alice e Bob obtêm chaves peneiradas de MESMO comprimento e
-      ordenadas de forma idêntica.
+  announcement() -> dict
+      Mensagem pública do sifting:
+        {"slot_ps": int, "idx": [k, ...], "bases": "1212..."}
+      Os timestamps finos ficam no nó.
+
+  perform_sifting(local_key, remote, is_bob=False)
+      `remote` é o dict de announcement() recebido do outro nó. Valida a
+      mensagem (mesmo slot_ps, tamanhos iguais, códigos 1/2, índices
+      estritamente crescentes) e levanta ValueError se algo estiver errado;
+      ALICE.py/BOB.py tratam o erro abortando a sessão.
+        - slot ocupado nos DOIS nós = coincidência (np.intersect1d);
+        - se os códigos de base forem iguais, o bit local entra na chave
+          peneirada (em Bob, INVERTIDO: 1 - bit, por causa da
+          anticorrelação do singleto).
+      Retorna (chave peneirada uint8, comprimento). Os slots comuns são
+      percorridos em ordem crescente nos dois nós, então Alice e Bob obtêm
+      chaves peneiradas de MESMO comprimento e ordenadas de forma idêntica.
 
   calculate_qber(qber_bits_a, qber_bits_b)
       Compara dois vetores e devolve a fração de bits diferentes. NÃO é usado
@@ -632,12 +657,42 @@ As duas primeiras linhas do arquivo (`import SIMLINK` e
   * Suposição: os timestamps de Alice e Bob estão numa base de tempo comum
     (no hardware real, relógio de Rb compartilhado/sincronização; no
     simulador, a base é comum por construção).
-  * Janela de 800 ps vs. jitter: a diferença entre dois jitters gaussianos
-    independentes (sigma ~148,6 ps cada) tem sigma ~210 ps; a janela de
-    +-800 ps cobre ~3,8 sigma, ou seja, ~99,99% dos pares verdadeiros
-    (estimativa).
+  * Slot vs. jitter: a diferença entre dois jitters gaussianos independentes
+    (sigma ~148,6 ps cada) tem sigma ~210 ps. Um par verdadeiro só conta se
+    as duas detecções caírem no MESMO slot; os que ficam em slots vizinhos
+    são perdidos (fração ~E|dt|/slot_ps, ~10% com 1600 ps). Medido no
+    simulador (2 s, seed 11, calibração atual): 800 ps -> 2374 bits/s,
+    QBER 2,02%; 1600 ps -> 2695 bits/s, 2,10%; 3200 ps -> 2866 bits/s,
+    2,34%; 6400 ps -> 2972 bits/s, 2,83%. Slots maiores recuperam pares,
+    mas admitem mais coincidências acidentais.
   * Coincidências acidentais (fótons de pares diferentes, dark counts) entram
     no sifting como eventos com 50% de erro; elas elevam a QBER observada.
+
+7.4 Por que índices de slot, e não timestamps
+---------------------------------------------
+  Antes, Alice e Bob publicavam os timestamps de todas as detecções em
+  resolução de ps. Com as duas listas, qualquer espião calculava
+  dt = t_Alice - t_Bob de cada par peneirado. Como cada detector tem atraso
+  e jitter próprios, a distribuição de dt depende de QUAL detector disparou,
+  isto é, do valor do bit (canal lateral temporal; Lamas-Linares e
+  Kurtsiefer, Opt. Express 15, 9388, 2007). Esse vazamento não entrava em
+  `leaked_bits` nem na privacy amplification.
+
+  Medido no simulador (1 s, seed 7), acerto de um espião que só olha o dt
+  público, com o protocolo antigo:
+      resíduo de calibração 0 ps
+      (calibração atual)            -> 50,8% (sem vazamento)
+      resíduo de 50 ps              -> 53,6%
+      calibração antiga do ALICE.py
+      (resíduo de 100 ps, ver 16.4) -> 58,2%
+
+  Agora só trafegam o índice do slot e o código da base. A posição da
+  detecção dentro do slot fica oculta. Resta um efeito de segunda ordem: a
+  chance de um par cair em slots vizinhos (e ser descartado) depende um
+  pouco do atraso de cada detector, o que pode enviesar levemente a
+  proporção de 0s e 1s entre os pares mantidos. O efeito diminui com
+  calibração melhor e com slot_ps muito maior que o resíduo; nos testes,
+  a fração de 1s na chave peneirada ficou entre 49,7% e 50,1%.
 
 
 ================================================================================
@@ -660,8 +715,8 @@ Cada mensagem é uma string UTF-8 precedida por um cabeçalho de 8 bytes
   _receive_message(sock)         lê o cabeçalho e depois o corpo.
 
 Isso permite mensagens de qualquer tamanho (por exemplo, os vetores de
-timestamps do sifting, que passam de megabytes) sem depender de um tamanho
-máximo de buffer.
+índices de slot do sifting, que passam de megabytes) sem depender de um
+tamanho máximo de buffer.
 
 8.2 class AliceClassicalChannel  (servidor)
 -------------------------------------------
@@ -1039,12 +1094,14 @@ Constante: `_DEFAULT_QBER_MAX = 0.11` (limiar usual do BB84/BBM92, ~11%).
 Os dois programas têm a mesma estrutura:
 
   1. Constantes lidas do ambiente (EC_METHOD, AUTH_KEY_FILE, CAPTURE_S,
-     CLASSIC_PORT) e instalação do hardware simulado com seed=42.
+     CLASSIC_PORT, SLOT_PS) e instalação do hardware simulado com seed=42.
   2. `with <Canal>(...) as channel:` abre a conexão TCP única.
   3. Cria `BBM92HardwareManager`, calibra os atrasos e captura.
-  4. `BBM92ProtocolEngine(coincidence_window_ps=800).process_time_tags(...)`.
-  5. Monta {"ts": valid_ts.tolist(), "bases": bases.tolist()}, troca com o
-     outro nó via `channel.exchange(json.dumps(...))` e faz o sifting.
+  4. `BBM92ProtocolEngine(slot_ps=SLOT_PS).process_time_tags(...)`.
+  5. Monta `engine.announcement()` = {"slot_ps", "idx", "bases"} (índices de
+     slot e códigos 1/2; nenhum timestamp), troca com o outro nó via
+     `channel.exchange(json.dumps(...))` e faz o sifting. Mensagem inválida
+     ou SLOT_PS diferente: imprime "[ABORTADO] Sifting inválido: ..." e sai.
   6. Se a chave peneirada tem 0 bits, imprime o erro e encerra.
   7. Cria o `ClassicalLink`, registra o sifting na transcrição com
      `link.record(...)`, carrega o `AuthKeyPool` e chama `run_postprocessing`,
@@ -1058,7 +1115,7 @@ Os dois programas têm a mesma estrutura:
   Canal               AliceClassicalChannel(port)      BobClassicalChannel(host, port)
   Papel TCP           servidor (espera Bob)            cliente (exige ALICE_HOST)
   node_type           'Alice'                          'Bob'
-  Calibração          {1:0, 2:50, 3:0, 4:50}           {5:12500, 6:12550, 7:12500, 8:12550}
+  Calibração          {1:0, 2:-50, 3:0, 4:-50}         {5:12500, 6:12550, 7:12500, 8:12550}
   perform_sifting     is_bob=False                     is_bob=True (inverte os bits)
   ClassicalLink       role="alice"                     role="bob"
   link.record         (alice_msg=minha, bob_msg=       (alice_msg=recebida, bob_msg=
@@ -1104,8 +1161,11 @@ que trafega é público. Cada linha abaixo é uma troca lógica (Alice <-> Bob).
 
   Fase / direção                     Conteúdo
   ---------------------------------  -----------------------------------------------
-  SIFTING   Alice e Bob (troca)      {"ts": [int ps, ...], "bases": ["Z"|"X", ...]}
-                                     (nenhum bit; ~20 bytes por detecção)
+  SIFTING   Alice e Bob (troca)      {"slot_ps": int, "idx": [índice de slot, ...],
+                                      "bases": "1212..."}
+                                     (1 = retilínea, 2 = diagonal; nenhum bit e
+                                      nenhum timestamp fino; ~12 bytes por
+                                      slot ocupado)
 
   PE        Alice -> Bob             {"n": N, "idx": [posições], "bits": hex}
             Bob -> Alice             {"errors": int}  ou  {"abort": "motivo"}
@@ -1417,13 +1477,20 @@ simulado; são pontos a conhecer (ou corrigir) antes de evoluir o projeto.
   (qber_upper = qber + mu). Com chaves curtas, qber_upper pode superar 11% (até
   50%) sem abortar; o resultado é uma chave final vazia (l = 0), não um aborto.
 
-16.4 Sinal da calibração de Alice
-  O simulador soma `delay_ps` aos timestamps. Em Bob, +12500/+12550 cancelam os
-  desvios de -12500/-12550. Em Alice, os desvios intrínsecos são +50 ps nos
-  canais 2 e 4 e a calibração também SOMA +50, o que leva o descasamento
-  relativo desses canais de 50 para 100 ps. É irrelevante frente à janela de
-  800 ps e ao jitter (~150 ps por detector), mas indica que o sinal da
-  calibração de Alice não "cancela" o desvio como o de Bob.
+16.4 Sinal da calibração de Alice (CORRIGIDO)
+  O simulador, como o driver real, SOMA `delay_ps` aos timestamps; o atraso
+  que cancela um desvio é o seu negativo. Em Bob, +12500/+12550 já cancelavam
+  os desvios de -12500/-12550. Em Alice, os desvios intrínsecos são +50 ps
+  nos canais 2 e 4, e a versão anterior calibrava com +50 em vez de -50,
+  levando o descasamento desses canais de 50 para ~100 ps. ALICE.py agora usa
+  {1: 0, 2: -50, 3: 0, 4: -50}, e o resíduo medido caiu para menos de 5 ps
+  (ver 6.5). O driver real aceita atrasos negativos em `setInputDelay`.
+  O erro parecia irrelevante porque não alterava a TAXA de coincidências,
+  mas os canais 2 e 4 são os detectores de bit 1 (V e A). Enquanto os
+  timestamps eram publicados, o resíduo de 100 ps permitia a um espião
+  acertar ~58% dos bits de Alice pelo dt público (ver 7.4). Com o sifting
+  por índice de slot ele já não vazava por evento, mas ainda aumentava o
+  efeito de borda descrito em 7.4.
 
 16.5 Docstring e CLI do SIMLINK desatualizados em relação ao BBM92.py atual
   A docstring descreve um bloco `__main__` em BBM92.py que calibra só os canais
@@ -1456,10 +1523,10 @@ simulado; são pontos a conhecer (ou corrigir) antes de evoluir o projeto.
   parte do caminho ALICE.py/BOB.py.
 
 16.10 Desempenho em Python puro
-  `process_time_tags` e `perform_sifting` usam laços Python sobre cada detecção
-  (~150 mil por segundo de captura), e o sifting serializa os timestamps em JSON.
-  Para capturas longas, vetorize esses laços (NumPy) e troque o formato por um
-  binário compacto.
+  `process_time_tags` e `perform_sifting` são vetorizados com NumPy. O sifting
+  ainda serializa os índices de slot em JSON (~12 bytes por slot ocupado);
+  para capturas longas, um formato binário compacto (por exemplo, diferenças
+  entre índices consecutivos) reduziria o tráfego e a transcrição.
 
 16.11 Compatibilidade de versões
   Alice e Bob devem usar a mesma versão do NumPy (seção 3.4). A parte
@@ -1484,8 +1551,14 @@ simulado; são pontos a conhecer (ou corrigir) antes de evoluir o projeto.
      parâmetro existe, mas ALICE.py/BOB.py não o utilizam hoje).
   4. Recalibre os atrasos: substitua os valores de `calibrate_delays` pelos
      medidos no seu arranjo (por exemplo, por correlação cruzada entre os
-     timestamps de Alice e Bob). Os números 50/12500/12550 pertencem ao
-     simulador.
+     timestamps de Alice e Bob). Atenção a dois pontos:
+       - Sinal: `setInputDelay` SOMA o valor, então use atraso = -desvio
+         (ver 6.5 e 16.4). Depois de calibrar, confira que o desvio médio
+         de cada detector ficou próximo de zero.
+       - Sigilo: a correlação cruzada exige trocar timestamps finos. Faça
+         isso numa sessão de calibração separada, cujos dados NUNCA são
+         usados para gerar chave (ver 7.4).
+     Os números 50/12500/12550 pertencem ao simulador.
   5. Sincronização: o código assume timestamps em base de tempo comum (relógio
      de referência compartilhado, como o Rb da arquitetura descrita no SIMLINK)
      e não alinha a origem dos dois taggers nem coordena o início das capturas;

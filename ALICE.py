@@ -1,7 +1,6 @@
 import json
 import os
 import socket
-import numpy as np
 from BBM92 import BBM92HardwareManager, BBM92ProtocolEngine
 from CLASSIC_CHANNEL import AliceClassicalChannel
 from AUXILIARY import AuthKeyPool, ClassicalLink, PostProcessingError
@@ -10,8 +9,10 @@ from POSTPROCESS import run_postprocessing
 # --- Configuração do pós-processamento (pode ser sobrescrita por variáveis de ambiente) ---
 EC_METHOD = os.environ.get("EC_METHOD", "cascade")            # 'cascade' (padrão) ou 'ldpc'
 AUTH_KEY_FILE = os.environ.get("AUTH_KEY_FILE", "auth_key.json")  # chave pré-compartilhada (mesmo arquivo em Alice e Bob)
-CAPTURE_S = float(os.environ.get("CAPTURE_S", "0.01"))       # duração da captura (s); IGUAL em Alice e Bob
+CAPTURE_S = float(os.environ.get("CAPTURE_S", "2"))       # duração da captura (s); IGUAL em Alice e Bob
 CLASSIC_PORT = int(os.environ.get("CLASSIC_PORT", "65432"))   # ÚNICA porta TCP (sifting + pós-processamento); IGUAL em Alice e Bob
+SLOT_PS = int(os.environ.get("SLOT_PS", "800"))              # largura do slot de coincidência (ps); IGUAL em Alice e Bob
+
 
 # Utilizar apenas no teste de hardware simulado
 #import SIMLINK
@@ -38,35 +39,38 @@ def main():
     with AliceClassicalChannel(port=CLASSIC_PORT) as channel:
         hw = BBM92HardwareManager(node_type='Alice')
         try:
-            hw.calibrate_delays({1: 0, 2: 50, 3: 0, 4: 50})
+            # setInputDelay SOMA o valor aos timestamps: para cancelar um desvio
+            # intrínseco de +50 ps nos detectores V/A (canais 2 e 4), o atraso é -50 ps.
+            hw.calibrate_delays({1: 0, 2: -50, 3: 0, 4: -50})
 
             print("[ALICE] Realizando capturas do SPAD...")
             timestamps, channels = hw.capture_stream(duration_s=CAPTURE_S)
         finally:
             hw.close()  # libera o Time Tagger (freeTimeTagger); só a captura usa o hardware
 
-        engine = BBM92ProtocolEngine(coincidence_window_ps=800)
+        engine = BBM92ProtocolEngine(slot_ps=SLOT_PS)
         key, sifted_len = engine.process_time_tags(timestamps, channels)
         print(f"[ALICE] Chave gerada (não peneirada): {sifted_len} bits adquiridos.")
 
-        dados_bases_alice = {
-            "ts": engine.valid_ts.tolist(),
-            "bases": engine.bases.tolist()
-        }
+        # Só índices de slot + código da base (1 = retilínea, 2 = diagonal):
+        # os timestamps finos NÃO são enviados (vazariam o valor do bit).
+        dados_bases_alice = engine.announcement()
+
 
         # Troca de bases (sifting) pela conexão persistente
         print("[ALICE] Trocando BASES (Sifting) via canal clássico...")
         resposta_bob = channel.exchange(json.dumps(dados_bases_alice))
-        dados_bob = json.loads(resposta_bob)
+        try:
+            dados_bob = json.loads(resposta_bob)
 
-        ts_bob = np.array(dados_bob["ts"])
-        bases_bob = np.array(dados_bob["bases"])
-
-        sifted_key, final_sifted_len = engine.perform_sifting(key, ts_bob, bases_bob, is_bob=False)
+            sifted_key, final_sifted_len = engine.perform_sifting(key, dados_bob, is_bob=False)
+        except ValueError as exc:
+            print(f"[ALICE][ABORTADO] Sifting inválido: {exc}")
+            return
         if final_sifted_len == 0:
             print("[ALICE][ERRO] Nenhuma coincidência foi encontrada entre Alice e "
                   "Bob. Verifique a conectividade de rede (host/porta) e se os "
-                  "dois processos usam a mesma seed/duração de captura. "
+                  "dois processos usam a mesma seed/duração de captura/SLOT_PS. "
                   "Encerrando sem gerar chave.")
             return
         print(f"Chave bruta: {key} bits")
@@ -76,7 +80,7 @@ def main():
         # PE (QBER) -> correção de erros -> privacy amplification -> autenticação,
         # tudo na MESMA conexão TCP do sifting.
         link = ClassicalLink(role="alice", channel=channel)
-        # As bases/timestamps trocados no sifting também entram na transcrição autenticada:
+        # Os índices de slot/bases trocados no sifting também entram na transcrição autenticada:
         link.record(alice_msg=json.dumps(dados_bases_alice), bob_msg=resposta_bob)
         pool = AuthKeyPool.load(AUTH_KEY_FILE)
         try:

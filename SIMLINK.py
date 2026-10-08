@@ -70,7 +70,7 @@ Nota sobre calibração de canais
 --------------------------------
 Cada nó calibra apenas os SEUS canais (BBM92HardwareManager ignora, com aviso,
 canais de outro nó): ALICE.py chama
-    hw.calibrate_delays({1: 0, 2: 50, 3: 0, 4: 50})
+    hw.calibrate_delays({1: 0, 2: -50, 3: 0, 4: -50})
 e BOB.py chama
     hw.calibrate_delays({5: 12500, 6: 12550, 7: 12500, 8: 12550})
 Este simulador dá aos canais D/A (base X, canais 3, 4, 7 e 8) o MESMO
