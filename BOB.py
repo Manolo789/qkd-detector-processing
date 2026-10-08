@@ -8,7 +8,7 @@ from POSTPROCESS import run_postprocessing
 # --- Configuração do pós-processamento (deve ser IGUAL à de ALICE.py) ---
 EC_METHOD = os.environ.get("EC_METHOD", "cascade")
 AUTH_KEY_FILE = os.environ.get("AUTH_KEY_FILE", "auth_key.json")
-CAPTURE_S = float(os.environ.get("CAPTURE_S", "2"))       # duração da captura (s); IGUAL em Alice e Bob
+CAPTURE_S = float(os.environ.get("CAPTURE_S", "0.01"))       # duração da captura (s); IGUAL em Alice e Bob
 CLASSIC_PORT = int(os.environ.get("CLASSIC_PORT", "65432"))   # ÚNICA porta TCP (sifting + pós-processamento); IGUAL em Alice e Bob
 SLOT_PS = int(os.environ.get("SLOT_PS", "800"))              # largura do slot de coincidência (ps); IGUAL em Alice e Bob
 
