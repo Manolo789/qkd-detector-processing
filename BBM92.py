@@ -1,8 +1,3 @@
-# Utilizar apenas no teste de hardware simulado
-#import SIMLINK
-#SIMLINK.install_simulated_hardware(pair_rate_hz=3e6, eve_intercept_resend=False)
-
-
 import warnings
 
 import Swabian.TimeTagger as TT

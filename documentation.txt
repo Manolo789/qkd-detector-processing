@@ -4,8 +4,10 @@
 #   Sistema de QKD baseado em emaranhamento (BBM92) com hardware simulado      #
 #   e pós-processamento clássico completo                                      #
 #                                                                              #
-#   Arquivos cobertos: ALICE.py, BOB.py, BBM92.py, SIMLINK.py,                 #
+#   Arquivos cobertos: QKD_NODE.py, ALICE.py, BOB.py, BBM92.py, SIMLINK.py,    #
 #                      CLASSIC_CHANNEL.py, AUXILIARY.py, POSTPROCESS.py        #
+#                                                                              #
+#   Versão: v0.2.0                                                             #
 #                                                                              #
 ################################################################################
 
@@ -22,7 +24,7 @@ SUMÁRIO
   8.  Referência: CLASSIC_CHANNEL.py (canal TCP persistente)
   9.  Referência: AUXILIARY.py     (primitivas do pós-processamento)
   10. Referência: POSTPROCESS.py   (PE -> EC -> PA -> AUTH)
-  11. Referência: ALICE.py e BOB.py (programas principais)
+  11. Referência: QKD_NODE.py, ALICE.py e BOB.py (sessão de nó e CLI)
   12. Mensagens trocadas na rede (formato por fase)
   13. Parâmetros de segurança e fórmulas
   14. Desempenho e dimensionamento (medições)
@@ -57,7 +59,7 @@ A cadeia é:
    captura de time tags (SPADs)
         |
         v
-   coincidências + sifting (BBM92)             <- BBM92.py / ALICE.py / BOB.py
+   coincidências + sifting (BBM92)             <- BBM92.py (orquestrado por QKD_NODE.py)
         |
         v
    estimação de parâmetros (QBER, Serfling)    \
@@ -75,7 +77,11 @@ A cadeia é:
    autenticação Wegman-Carter da transcrição   /
         |
         v
-   chave secreta final
+   chave secreta final  ---> ID da chave (hash da transcrição autenticada)
+        |
+        v
+   saída: relatório legível (ALICE.py/BOB.py) ou 1 linha JSON para um
+          gerenciador de chaves externo, como o qpass (QKD_NODE.py --json)
 
 1.2 O protocolo BBM92 em poucas linhas
 --------------------------------------
@@ -110,11 +116,17 @@ mesma tabela (`ALICE_CHANNELS`, `BOB_CHANNELS`, `CHANNEL_MAP`).
 
 1.4 Hardware simulado
 ---------------------
-Por padrão o projeto NÃO precisa de nenhum equipamento: o SIMLINK.py injeta um
-módulo "Swabian.TimeTagger" falso em `sys.modules` que gera, por Monte Carlo,
+O projeto pode rodar SEM nenhum equipamento: o SIMLINK.py injeta um módulo
+"Swabian.TimeTagger" falso em `sys.modules` que gera, por Monte Carlo,
 timestamps e canais fisicamente plausíveis (fonte SPDC, jitter, perdas, dark
-counts, QBER intrínseca, espiã opcional). Detalhes na seção 6. A seção 17
-descreve como trocar pelo hardware real.
+counts, QBER intrínseca, espiã opcional). Detalhes na seção 6.
+
+O simulador é ligado por PARÂMETRO, sem editar código:
+  * ALICE.py / BOB.py:  variável de ambiente SIMULATE=1;
+  * QKD_NODE.py:        opção --simulate (e --sim-seed, --sim-eve);
+  * API Python:         SessionConfig(simulate=True, ...).
+Sem isso, o driver real (pacote Swabian-TimeTagger) é usado. A seção 17
+descreve a operação com o hardware real.
 
 IMPORTANTE: a simulação existe para testar e demonstrar a cadeia de software.
 Como os dois processos sorteiam o "mundo quântico" a partir da MESMA semente
@@ -128,11 +140,18 @@ o pipeline de coincidência, sifting e pós-processamento.
 
 2.1 Arquivos
 ------------
-  ALICE.py            Programa principal do nó Alice (servidor TCP). Captura,
-                      faz o sifting, chama o pós-processamento e imprime o
-                      resultado.
-  BOB.py              Programa principal do nó Bob (cliente TCP). Espelho de
-                      ALICE.py, com os papéis invertidos.
+  QKD_NODE.py         Sessão completa de UM nó (Alice ou Bob) numa função,
+                      `run_session(SessionConfig) -> SessionResult`: captura,
+                      sifting, pós-processamento e ID da chave. Também é a CLI
+                      para gerenciadores de chave externos (saída JSON) e para
+                      o reservatório de autenticação (auth-init/auth-status).
+                      Não implementa nenhuma etapa nova do protocolo: apenas
+                      encadeia os módulos abaixo.
+  ALICE.py            Invólucro fino do nó Alice (servidor TCP): lê as
+                      variáveis de ambiente, imprime o IP local, chama
+                      `run_session(role="alice")` e imprime o relatório.
+  BOB.py              Invólucro fino do nó Bob (cliente TCP): idem, com
+                      `run_session(role="bob", peer_host=ALICE_HOST)`.
   BBM92.py            `BBM92HardwareManager` (interface com o Time Tagger) e
                       `BBM92ProtocolEngine` (mapeamento canal->base/bit e
                       sifting por coincidência temporal).
@@ -151,28 +170,39 @@ o pipeline de coincidência, sifting e pós-processamento.
 
 2.2 Grafo de dependências
 -------------------------
-  ALICE.py / BOB.py
-    |-- SIMLINK.py            (install_simulated_hardware)
-    |-- BBM92.py
-    |     '-- SIMLINK.py      (BBM92.py também instala o hardware simulado)
-    |           '--> registra em sys.modules o módulo "Swabian.TimeTagger"
-    |                que BBM92.py importa como `TT`
-    |-- CLASSIC_CHANNEL.py    (AliceClassicalChannel / BobClassicalChannel)
-    |-- AUXILIARY.py
-    |     '-- CLASSIC_CHANNEL.py   (só para checar o tipo do canal)
-    '-- POSTPROCESS.py
-          '-- AUXILIARY.py
+  ALICE.py / BOB.py            gerenciador de chaves externo (ex.: qpass)
+          |                          |  subprocesso: QKD_NODE.py session --json
+          '-------------+------------'
+                        v
+                   QKD_NODE.py
+                    |-- SIMLINK.py            (só com simulate=True; instalado
+                    |                          ANTES de importar BBM92.py)
+                    |     '--> registra em sys.modules o módulo
+                    |          "Swabian.TimeTagger" que BBM92.py importa como `TT`
+                    |-- BBM92.py              (importado dentro de run_session)
+                    |     '-- Swabian.TimeTagger (real ou simulado)
+                    |-- CLASSIC_CHANNEL.py    (AliceClassicalChannel / BobClassicalChannel)
+                    |-- AUXILIARY.py          (ClassicalLink, AuthKeyPool, pack_bits)
+                    |     '-- CLASSIC_CHANNEL.py   (só para checar o tipo do canal)
+                    '-- POSTPROCESS.py        (run_postprocessing)
+                          '-- AUXILIARY.py
 
 2.3 Divisão de responsabilidades
 --------------------------------
-  * Específico do protocolo QUÂNTICO (BBM92): BBM92.py, ALICE.py, BOB.py.
+  * Específico do protocolo QUÂNTICO (BBM92): BBM92.py.
     O sifting fica aqui porque depende de bases e de coincidências.
+  * Orquestração de um nó: QKD_NODE.py (run_session). É o ÚNICO lugar com o
+    roteiro da sessão; ALICE.py, BOB.py e a CLI JSON reutilizam essa função,
+    em vez de manter cópias espelhadas do mesmo fluxo.
   * Independente de protocolo e de nó: POSTPROCESS.py + AUXILIARY.py.
     Alice e Bob chamam as MESMAS funções, com o mesmo roteiro; o papel de cada
     um vem de `link.role` ('alice' ou 'bob').
   * Transporte: CLASSIC_CHANNEL.py (conexão TCP) e `ClassicalLink`
     (AUXILIARY.py), que adapta o canal ao pós-processamento e grava a
     transcrição usada na autenticação.
+  * Gestão das chaves geradas (armazenar, listar, entregar, consumir): FORA
+    deste projeto, num gerenciador de chaves (ex.: qpass), que consome a saída
+    JSON do QKD_NODE.py (seção 11.5). Este projeto não guarda chaves finais.
 
 
 ================================================================================
@@ -190,7 +220,7 @@ o pipeline de coincidência, sifting e pós-processamento.
 
 3.2 Instalação dos arquivos
 ---------------------------
-Copie os 7 arquivos .py para um mesmo diretório em CADA uma das duas máquinas.
+Copie os 8 arquivos .py para um mesmo diretório em CADA uma das duas máquinas.
 
 3.3 Rede
 --------
@@ -214,6 +244,8 @@ diferentes e não haverá coincidências.
 A autenticação Wegman-Carter exige um segredo prévio. Gere UMA vez:
 
     python AUXILIARY.py --gen-auth-key auth_key.json 8192
+    # ou, equivalente (recusa sobrescrever um arquivo existente sem --force):
+    python QKD_NODE.py auth-init --auth-key-file auth_key.json --bits 8192
 
 e copie o MESMO arquivo, por um meio seguro (pendrive, canal já autenticado
 etc., nunca pela rede do experimento), para Alice e Bob. Ambos precisam
@@ -228,6 +260,9 @@ partir do mesmo conteúdo e da mesma posição (`pos`).
     "bits": <hex>}, gravado de forma atômica (arquivo .tmp + os.replace).
     NÃO reutilize, nem restaure de um backup antigo: bits de one-time pad
     nunca podem ser usados duas vezes.
+  * Estado do reservatório, sem expor os bits:
+        python QKD_NODE.py auth-status --auth-key-file auth_key.json
+        -> {"exists": true, "path": ..., "n": 8192, "pos": 381, "remaining": 7811}
 
 
 ================================================================================
@@ -240,7 +275,8 @@ partir do mesmo conteúdo e da mesma posição (`pos`).
 
   2. Na máquina de ALICE (inicie primeiro):
 
-         python ALICE.py
+         python ALICE.py                 # hardware real
+         SIMULATE=1 python ALICE.py      # hardware simulado
 
      Ela imprime o IP local, ex.:
          [ALICE] IP desta máquina na rede (configure ALICE_HOST em BOB.py ...): 192.168.1.10
@@ -248,7 +284,7 @@ partir do mesmo conteúdo e da mesma posição (`pos`).
 
   3. Na máquina de BOB, informe o IP de Alice:
 
-         # Linux/macOS
+         # Linux/macOS (acrescente SIMULATE=1 se Alice também estiver simulando)
          ALICE_HOST=192.168.1.10 python BOB.py
          # Windows (PowerShell)
          $env:ALICE_HOST="192.168.1.10"; python BOB.py
@@ -272,31 +308,37 @@ partir do mesmo conteúdo e da mesma posição (`pos`).
   CAPTURE_S     0.01             Alice, Bob   Duração da captura em segundos.
                                               DEVE ser igual nos dois nós.
   CLASSIC_PORT  65432            Alice, Bob   Porta TCP única. DEVE ser igual.
-  SLOT_PS       1600             Alice, Bob   Largura do slot de coincidência
+  SLOT_PS       800              Alice, Bob   Largura do slot de coincidência
                                               (ps). DEVE ser igual; se diferir,
                                               os dois nós abortam no sifting.
+  SIMULATE      0                Alice, Bob   1 = hardware simulado (SIMLINK,
+                                              seed=42, pair_rate=3e6). DEVE ser
+                                              igual nos dois nós.
   ALICE_HOST    (vazio)          só Bob       IP de Alice. Obrigatória em Bob.
+
+As mesmas opções existem na CLI do QKD_NODE.py (seção 11.5): --capture-s,
+--slot-ps, --ec, --port, --auth-key-file, --simulate, --peer-host.
 
 ATENÇÃO ao padrão de CAPTURE_S: com 0,01 s a simulação produz apenas ~15 bits
 peneirados (medido) e a chave final sai VAZIA. Isso não é defeito: o custo de
 tamanho finito consome tudo (seção 13). Para obter chave, use capturas de
 alguns segundos (seção 14):
 
-         CAPTURE_S=2 python ALICE.py
-         CAPTURE_S=2 ALICE_HOST=192.168.1.10 python BOB.py
+         SIMULATE=1 CAPTURE_S=2 python ALICE.py
+         SIMULATE=1 CAPTURE_S=2 ALICE_HOST=192.168.1.10 python BOB.py
 
-4.3 Parâmetros fixos no código (editar nos dois arquivos, de forma idêntica)
----------------------------------------------------------------------------
-  * Em ALICE.py / BOB.py:
-      - `SIMLINK.install_simulated_hardware(pair_rate_hz=3e6,
-         eve_intercept_resend=False, seed=42)`: taxa de pares, presença de
-         espiã e semente da simulação. Mude `eve_intercept_resend=True`
-         em AMBOS para demonstrar a detecção de espionagem.
-      - Slot de coincidência: `BBM92ProtocolEngine(slot_ps=SLOT_PS)` (variável
-        de ambiente SLOT_PS, padrão 1600 ps = largura total da antiga janela
-        de +-800 ps).
-      - Atrasos de calibração: `hw.calibrate_delays({...})` (valores
-        diferentes por nó, ver 11.2).
+4.3 Parâmetros da sessão e onde ajustá-los (sempre iguais nos dois nós)
+-----------------------------------------------------------------------
+  * Em `QKD_NODE.SessionConfig` (ou nas opções da CLI do QKD_NODE.py):
+      - Simulação: `simulate`, `sim_pair_rate_hz` (3e6), `sim_seed` (42) e
+        `sim_eve` (False), repassados a `SIMLINK.install_simulated_hardware`.
+        Para demonstrar a detecção de espionagem, use `--sim-eve` em AMBOS
+        os nós (ALICE.py/BOB.py não expõem essa opção; use o QKD_NODE.py).
+      - Slot de coincidência: `BBM92ProtocolEngine(slot_ps=slot_ps)`
+        (SLOT_PS / --slot-ps, padrão 800 ps).
+      - Atrasos de calibração: `QKD_NODE.DEFAULT_DELAYS` por papel, ou
+        `delays` / --delays '{"canal": atraso_ps, ...}' (ver 11.2).
+      - Número de série do Time Tagger: `serial_number` / --serial.
   * Em `run_postprocessing(...)`, não expostos por variável de ambiente:
     sample_fraction (0,20), qber_threshold (0,11), eps_sec (1e-9),
     eps_cor (1e-10), replenish_auth (True), ec_kwargs (n_passes, frame_size,
@@ -311,7 +353,7 @@ alguns segundos (seção 14):
   [POS-ALICE] [AUTH] 128 mensagens / 25281 bytes autenticados: OK (consumiu 381 bits de chave; restam 7811)
   [POS-ALICE] [AUTH] 381 bits da chave final devolvidos ao reservatório de autenticação.
 
-Em seguida ALICE.py/BOB.py imprimem o bloco "=== RESULTADOS FINAIS ===" (seção 11).
+Em seguida ALICE.py/BOB.py imprimem o bloco "=== RESULTADOS FINAIS ===" (seção 11.6).
 (Nesse log, "128 mensagens" vem de um teste com link em memória; numa execução
 real o número difere porque inclui a troca de sifting e depende do QBER.)
 
@@ -324,8 +366,10 @@ real o número difere porque inclui a troca de sifting e depende do QBER.)
 ------------------
         ALICE (servidor)                                  BOB (cliente)
         ----------------                                  -------------
-  F0    instala hardware simulado (seed)                  instala hardware simulado (seed)
-        imprime o IP local
+  F0    [se simulate] instala hardware simulado (seed)    [se simulate] idem
+        importa BBM92 (driver real ou simulado)           importa BBM92
+        AuthKeyPool.load(auth_key_file)                   AuthKeyPool.load(auth_key_file)
+          (falha cedo, ANTES de abrir a conexão)
         abre o servidor TCP e espera (accept) <---------- conecta (tenta por até 30 s)
 
   F1    cria BBM92HardwareManager('Alice')                cria BBM92HardwareManager('Bob')
@@ -339,7 +383,6 @@ real o número difere porque inclui a troca de sifting e depende do QBER.)
         (se 0 coincidências: aborta com erro)             (se 0 coincidências: aborta com erro)
 
   F3    ClassicalLink(role, channel) + link.record(...)   (idem) -> sifting entra na transcrição
-        AuthKeyPool.load(AUTH_KEY_FILE)                   (idem)
         run_postprocessing:
           a) parameter_estimation  (amostra 20% -> QBER, limite de Serfling)
           b) error_correction      (Cascade ou LDPC) + verificação por hash
@@ -347,8 +390,10 @@ real o número difere porque inclui a troca de sifting e depende do QBER.)
           d) authentication        (tag Wegman-Carter sobre TODA a transcrição)
           e) reposição de 381 bits no reservatório (se a chave final > 381 bits)
 
-  F4    imprime "RESULTADOS FINAIS"                       imprime "RESULTADOS FINAIS"
-        fecha o socket (saída do bloco `with`)            fecha o socket
+  F4    fecha o socket (saída do bloco `with`)            fecha o socket
+        key_id = hash da transcrição (seção 11.4)         idem (mesmo valor)
+        devolve SessionResult                             devolve SessionResult
+        -> relatório (ALICE.py) ou JSON (--json)          -> relatório (BOB.py) ou JSON
 
 5.2 Princípio do "lockstep"
 ---------------------------
@@ -401,15 +446,20 @@ BBM92.py usa o driver real pelas chamadas abaixo (API do manual 2.22.6):
 e os registra em `sys.modules`. Assim `import Swabian.TimeTagger as TT` em
 BBM92.py resolve para o backend simulado, sem alterar o código do BBM92.
 
-Ordem de instalação em ALICE.py/BOB.py (detalhe sutil, mas correto):
-  1. `from BBM92 import ...` executa as linhas iniciais de BBM92.py, que
-     instalam o hardware simulado SEM semente (`pair_rate_hz=3e6`).
-  2. Depois, o código de nível de módulo de ALICE.py/BOB.py chama
-     `install_simulated_hardware(..., seed=42)`, que recria o enlace padrão
-     (`_DEFAULT_LINK`) COM semente.
-  3. `createTimeTagger()` lê `_DEFAULT_LINK` no momento da chamada (dentro de
-     `BBM92HardwareManager.__init__`, que roda depois), portanto vale o enlace
-     com seed=42 mesmo que BBM92 tenha guardado o módulo `TT` da 1ª instalação.
+Ordem de instalação (QKD_NODE.run_session):
+  1. Se `simulate=True`, `install_simulated_hardware(pair_rate_hz=...,
+     eve_intercept_resend=..., seed=...)` é chamado PRIMEIRO, registrando o
+     módulo falso e o enlace padrão (`_DEFAULT_LINK`) COM semente.
+  2. Só depois `from BBM92 import ...` é executado (importação tardia, dentro
+     de run_session); o `import Swabian.TimeTagger as TT` de BBM92.py resolve
+     para o simulador. Sem `simulate`, o mesmo import carrega o driver real.
+  3. As linhas de instalação no topo de BBM92.py permanecem COMENTADAS e não
+     devem ser reativadas: elas não passam `seed`, e a escolha entre real e
+     simulado agora é um parâmetro (SIMULATE=1 / --simulate).
+  Consequência: como BBM92 guarda a referência `TT` na importação, não é
+  possível alternar entre real e simulado no MESMO processo Python. Cada
+  execução de ALICE.py/BOB.py/QKD_NODE.py é um processo novo, então isso não
+  afeta o uso normal.
 
 6.2 Reprodutibilidade entre processos (Alice e Bob em máquinas diferentes)
 --------------------------------------------------------------------------
@@ -562,16 +612,18 @@ caso. Uma segunda chamada sem nova captura devolve um buffer vazio.
 
 Instala o simulador e executa o BBM92.py indicado. Na versão fornecida, o
 BBM92.py só define classes (não tem bloco `__main__`), então esse comando
-não produz saída útil (ver observação 16.5). O uso real é por ALICE.py/BOB.py.
+não produz saída útil (ver observação 16.5). O uso real é por QKD_NODE.py
+(--simulate) ou ALICE.py/BOB.py (SIMULATE=1).
 
 
 ================================================================================
 7. REFERÊNCIA: BBM92.py  (AQUISIÇÃO E SIFTING)
 ================================================================================
 
-As duas primeiras linhas do arquivo (`import SIMLINK` e
-`SIMLINK.install_simulated_hardware(...)`) fixam o uso do hardware simulado
-(ver seção 17 para removê-las). Depois vem `import Swabian.TimeTagger as TT`.
+As linhas de instalação do simulador no topo do arquivo (`import SIMLINK` e
+`SIMLINK.install_simulated_hardware(...)`) estão COMENTADAS: BBM92.py apenas
+faz `import Swabian.TimeTagger as TT`, e quem decide se esse módulo é o driver
+real ou o SIMLINK é o QKD_NODE.py, antes de importar BBM92 (ver 6.1).
 
 7.1 class BBM92HardwareManager
 ------------------------------
@@ -588,7 +640,7 @@ As duas primeiras linhas do arquivo (`import SIMLINK` e
       int(round(atraso)))` e, ao final, `tagger.sync()` para garantir que os
       atrasos já estão ativos. Canais que não pertencem ao nó são ignorados
       com um warning. Serve para compensar diferenças de comprimento de
-      fibra/cabo. Exemplos usados:
+      fibra/cabo. Valores padrão (`QKD_NODE.DEFAULT_DELAYS`, do simulador):
         Alice: {1: 0, 2: -50, 3: 0, 4: -50}
         Bob:   {5: 12500, 6: 12550, 7: 12500, 8: 12550}
 
@@ -604,7 +656,7 @@ As duas primeiras linhas do arquivo (`import SIMLINK` e
   close()
       Chama `TT.freeTimeTagger` e libera o dispositivo (idempotente). Também
       funciona como context manager (`with BBM92HardwareManager(...) as hw:`).
-      ALICE.py/BOB.py chamam close() logo após a captura.
+      `run_session` chama close() logo após a captura.
 
 7.2 class BBM92ProtocolEngine
 -----------------------------
@@ -614,7 +666,7 @@ As duas primeiras linhas do arquivo (`import SIMLINK` e
   __init__(coincidence_window_ps=1000, slot_ps=None)
       Guarda a largura do slot de coincidência. Sem `slot_ps`, usa
       2 x coincidence_window_ps (a largura total da antiga janela +-janela).
-      ALICE.py e BOB.py passam `slot_ps=SLOT_PS` (padrão 1600 ps). Monta o
+      `run_session` passa `slot_ps=cfg.slot_ps` (padrão 800 ps). Monta o
       `channel_map` {canal: (base, bit)} e tabelas de consulta vetorizadas.
 
   process_time_tags(timestamps, channels) -> (key, n)
@@ -638,7 +690,8 @@ As duas primeiras linhas do arquivo (`import SIMLINK` e
       `remote` é o dict de announcement() recebido do outro nó. Valida a
       mensagem (mesmo slot_ps, tamanhos iguais, códigos 1/2, índices
       estritamente crescentes) e levanta ValueError se algo estiver errado;
-      ALICE.py/BOB.py tratam o erro abortando a sessão.
+      `run_session` trata o erro devolvendo status "aborted"
+      (error_type "SiftingError").
         - slot ocupado nos DOIS nós = coincidência (np.intersect1d);
         - se os códigos de base forem iguais, o bit local entra na chave
           peneirada (em Bob, INVERTIDO: 1 - bit, por causa da
@@ -784,8 +837,8 @@ Módulo de uso restrito ao POSTPROCESS.py. Convenções:
                              chave curta, LDPC impossível...).
   AuthenticationError        a tag da transcrição não confere: descartar a chave.
   AuthKeyExhausted           chave de autenticação insuficiente.
-  (As três últimas herdam de PostProcessingError; ALICE.py/BOB.py capturam essa
-  classe base.)
+  (As três últimas herdam de PostProcessingError; QKD_NODE.run_session captura
+  essa classe base e a converte em status "aborted".)
 
   binary_entropy(x)          h2(x), com x limitado a [1e-12, 1-1e-12].
   as_bits(key)               cópia como uint8 achatado.
@@ -823,7 +876,9 @@ Adaptador entre o POSTPROCESS e o canal persistente.
                     A codificação é injetiva: reordenar, inserir, remover ou
                     alterar mensagens muda os bytes.
   O link NÃO abre nem fecha a conexão: quem a possui é o `with` de
-  ALICE.py/BOB.py. Crie o link DEPOIS de o canal estar conectado.
+  QKD_NODE.run_session. Crie o link DEPOIS de o canal estar conectado.
+  Depois da sessão, `transcript_bytes()` também é a base do ID da chave
+  (seção 11.4).
 
   make_local_link_pair()
     Devolve (link_alice, link_bob) ligados por filas em memória, para testes
@@ -1078,6 +1133,7 @@ Constante: `_DEFAULT_QBER_MAX = 0.11` (limiar usual do BB84/BBM92, ~11%).
                      eps_cor=1e-10, replenish_auth=True, ec_kwargs=None,
                      verbose=True) -> PostProcessResult
 
+  Chamado por QKD_NODE.run_session logo após o sifting.
   Executa PE (com eps_pe = eps_sec/4) -> EC -> PA -> AUTH. Se `replenish_auth` e
   a chave final tem mais de 381 bits, os ÚLTIMOS 381 bits da chave final são
   devolvidos ao reservatório (`auth_pool.add`) e removidos da chave entregue.
@@ -1086,70 +1142,198 @@ Constante: `_DEFAULT_QBER_MAX = 0.11` (limiar usual do BB84/BBM92, ~11%).
 
 
 ================================================================================
-11. REFERÊNCIA: ALICE.py E BOB.py  (PROGRAMAS PRINCIPAIS)
+11. REFERÊNCIA: QKD_NODE.py, ALICE.py E BOB.py  (SESSÃO DE NÓ E CLI)
 ================================================================================
 
-11.1 Estrutura comum
---------------------
-Os dois programas têm a mesma estrutura:
+11.1 Visão geral
+----------------
+Até a v0.1.0, ALICE.py e BOB.py continham, cada um, uma cópia espelhada do
+roteiro da sessão. A partir da v0.2.0 esse roteiro existe em um único lugar,
+`QKD_NODE.run_session`, e é reutilizado de três formas:
 
-  1. Constantes lidas do ambiente (EC_METHOD, AUTH_KEY_FILE, CAPTURE_S,
-     CLASSIC_PORT, SLOT_PS) e instalação do hardware simulado com seed=42.
-  2. `with <Canal>(...) as channel:` abre a conexão TCP única.
-  3. Cria `BBM92HardwareManager`, calibra os atrasos e captura.
-  4. `BBM92ProtocolEngine(slot_ps=SLOT_PS).process_time_tags(...)`.
-  5. Monta `engine.announcement()` = {"slot_ps", "idx", "bases"} (índices de
-     slot e códigos 1/2; nenhum timestamp), troca com o outro nó via
-     `channel.exchange(json.dumps(...))` e faz o sifting. Mensagem inválida
-     ou SLOT_PS diferente: imprime "[ABORTADO] Sifting inválido: ..." e sai.
-  6. Se a chave peneirada tem 0 bits, imprime o erro e encerra.
-  7. Cria o `ClassicalLink`, registra o sifting na transcrição com
-     `link.record(...)`, carrega o `AuthKeyPool` e chama `run_postprocessing`,
-     capturando `PostProcessingError` (imprime "[ABORTADO] <Tipo>: <msg>" e sai).
-  8. Imprime o bloco "RESULTADOS FINAIS".
+  ALICE.py / BOB.py         invólucros finos (variáveis de ambiente -> relatório)
+  QKD_NODE.py session       CLI; com --json, saída para gerenciadores de chave
+  API Python                SessionConfig -> run_session -> SessionResult
 
-11.2 Diferenças entre os dois
------------------------------
-                      ALICE.py                         BOB.py
+O QKD_NODE.py NÃO implementa nenhuma etapa nova do protocolo. Tudo que ele faz
+é encadear BBM92.py (captura e sifting), CLASSIC_CHANNEL.py (conexão),
+POSTPROCESS.run_postprocessing (PE -> EC -> PA -> AUTH) e AUXILIARY.py
+(ClassicalLink, AuthKeyPool, pack_bits), e devolver o resultado como dados.
+
+Roteiro de run_session(cfg):
+  1. Se cfg.simulate, instala o SIMLINK (seed, pair_rate, espiã) e só então
+     importa BBM92 (ver 6.1).
+  2. AuthKeyPool.load(cfg.auth_key_file) ANTES de abrir a conexão (falha cedo).
+  3. `with <Canal>(...) as channel:` abre a conexão TCP única
+     (AliceClassicalChannel para 'alice'; BobClassicalChannel(peer_host) para 'bob').
+  4. BBM92HardwareManager(node_type, serial_number): calibra (cfg.delays ou
+     DEFAULT_DELAYS[role]), captura cfg.capture_s segundos e libera o tagger.
+  5. BBM92ProtocolEngine(slot_ps).process_time_tags(...).
+  6. Troca de engine.announcement() e perform_sifting(is_bob = role == 'bob').
+     Mensagem inválida -> status "aborted" (SiftingError); 0 coincidências ->
+     status "aborted" (NoCoincidences).
+  7. ClassicalLink(role, channel) + link.record(msg_alice, msg_bob) e
+     run_postprocessing(...). PostProcessingError -> status "aborted".
+  8. key_id = hash da transcrição (11.4) e SessionResult com status "ok"
+     (chave não vazia) ou "empty" (l = 0).
+
+Divisão de erros:
+  * Resultados do PROTOCOLO (chave, chave vazia, aborto) voltam em
+    SessionResult.status, nos dois nós de forma consistente.
+  * Erros de INFRAESTRUTURA (auth_key.json ausente, ConnectionError, parâmetro
+    inválido, driver ausente, MemoryError) são propagados como exceção. No modo
+    --json eles viram status "error" (11.5).
+
+11.2 Diferenças entre os dois papéis
+------------------------------------
+                      role = "alice" (ALICE.py)        role = "bob" (BOB.py)
   ------------------  -------------------------------  -------------------------------
-  Canal               AliceClassicalChannel(port)      BobClassicalChannel(host, port)
-  Papel TCP           servidor (espera Bob)            cliente (exige ALICE_HOST)
+  Canal               AliceClassicalChannel(port)      BobClassicalChannel(peer_host, port)
+  Papel TCP           servidor (espera Bob)            cliente (exige peer_host / ALICE_HOST)
   node_type           'Alice'                          'Bob'
-  Calibração          {1:0, 2:-50, 3:0, 4:-50}         {5:12500, 6:12550, 7:12500, 8:12550}
+  DEFAULT_DELAYS      {1:0, 2:-50, 3:0, 4:-50}         {5:12500, 6:12550, 7:12500, 8:12550}
   perform_sifting     is_bob=False                     is_bob=True (inverte os bits)
   ClassicalLink       role="alice"                     role="bob"
   link.record         (alice_msg=minha, bob_msg=       (alice_msg=recebida, bob_msg=
                        recebida)                        minha)
-  Extra               imprime o IP local               aborta se ALICE_HOST estiver vazio
+  Extra (invólucro)   ALICE.py imprime o IP local      BOB.py aborta se ALICE_HOST vazio
 
 O `link.record` garante que a transcrição seja IDÊNTICA nos dois nós (primeiro a
-mensagem de Alice, depois a de Bob), requisito para a tag de autenticação.
+mensagem de Alice, depois a de Bob), requisito para a tag de autenticação e
+para o ID da chave.
 
-11.3 Saída final
+11.3 API Python
+---------------
+  SessionConfig (dataclass), todos os campos devem ser iguais nos dois nós,
+  exceto role, peer_host, delays e serial_number:
+    role               'alice' | 'bob'
+    peer_host          IP de Alice (obrigatório em Bob)            ""
+    port               porta TCP única                              65432
+    capture_s          duração da captura (s)                       0.01
+    slot_ps            largura do slot de coincidência (ps)         800
+    ec_method          'cascade' | 'ldpc'                           "cascade"
+    auth_key_file      reservatório Wegman-Carter                   "auth_key.json"
+    delays             {canal: atraso_ps} (None = DEFAULT_DELAYS)   None
+    serial_number      número de série do Time Tagger               None
+    simulate           usa o SIMLINK                                False
+    sim_seed           semente da simulação                         42
+    sim_eve            espiã intercept-resend                       False
+    sim_pair_rate_hz   taxa de pares simulada                       3e6
+    verbose            logs do protocolo                            True
+
+  run_session(cfg) -> SessionResult
+
+  SessionResult (dataclass):
+    status             'ok' | 'empty' | 'aborted' | 'error'
+    role, protocol     papel do nó e "bbm92"
+    key_id             ID público da chave (11.4); None se não houver chave
+    key_bits           comprimento da chave final, em bits
+    key_hex            pack_bits(final_key): hexadecimal, com zeros à direita
+                       até completar o último byte; None se não houver chave
+    raw_bits           slots ocupados antes do sifting
+    sifted_bits        bits após o sifting
+    qber, qber_upper   QBER da amostra e limite superior (Serfling)
+    ec_method, ec_efficiency, leaked_bits   resumo da correção de erros
+    authenticated      resultado da autenticação Wegman-Carter
+    replenished_bits   bits devolvidos ao reservatório de autenticação
+    auth_bits_remaining  bits restantes no reservatório
+    error_type, error_message   preenchidos em 'aborted' e 'error'
+    .to_json()         uma linha JSON (NaN de ec_efficiency vira null)
+    .exit_code         0 ok, 3 empty, 2 aborted, 1 error
+
+  print_report(res, show_key=True)   imprime o bloco "RESULTADOS FINAIS" (11.6)
+  key_id_from_transcript(link)       ID da chave (11.4)
+  DEFAULT_DELAYS                     atrasos de calibração por papel
+  EXIT_OK, EXIT_ERROR, EXIT_ABORTED, EXIT_EMPTY = 0, 1, 2, 3
+
+11.4 ID da chave
 ----------------
+    key_id = UUID( SHA-256( b"qkd-key-id/v1" || link.transcript_bytes() )[:16] )
+
+  * A transcrição autenticada (sifting, PE, EC, verificação, PA e a troca de
+    tags) é IDÊNTICA nos dois nós; é exatamente o que a tag Wegman-Carter
+    confere. Logo, Alice e Bob calculam o mesmo key_id sem nenhuma mensagem
+    adicional na rede.
+  * A transcrição é pública, então o ID também é público e não revela nada da
+    chave. Sessões diferentes têm transcrições diferentes (índices de slot,
+    sementes aleatórias), logo IDs diferentes.
+  * O formato UUID é compatível com o campo key_ID do ETSI GS QKD 014, o que
+    facilita expor as chaves por uma API de entrega no futuro.
+  * Só é calculado quando há chave (status "ok").
+
+11.5 Linha de comando do QKD_NODE.py
+------------------------------------
+    python QKD_NODE.py session --role alice|bob [--peer-host IP] [--port N]
+                               [--capture-s S] [--slot-ps PS] [--ec cascade|ldpc]
+                               [--auth-key-file F] [--delays JSON] [--serial SN]
+                               [--simulate [--sim-seed N] [--sim-eve]]
+                               [--json [--allow-tty]]
+    python QKD_NODE.py auth-status --auth-key-file F
+    python QKD_NODE.py auth-init   --auth-key-file F [--bits 8192] [--force]
+
+  Sem --json, `session` imprime o mesmo relatório de ALICE.py/BOB.py.
+
+  Contrato de `session --json` (para gerenciadores de chave, ex.: qpass):
+    stdout   UMA linha JSON (SessionResult.to_json); nada mais.
+    stderr   todos os logs do protocolo (stdout é redirecionado durante a sessão).
+    saída    0 = chave gerada; 3 = chave vazia; 2 = protocolo abortado;
+             1 = erro de infraestrutura.
+    TTY      recusa executar se stdout for um terminal, porque a chave sairia
+             na tela (ver 16.2). Use um pipe, ou --allow-tty só em testes.
+
+  Exemplo de linha emitida (chave abreviada):
+    {"status": "ok", "role": "alice", "protocol": "bbm92",
+     "key_id": "5d9c0e50-8ab2-b3b2-629d-34514fff4b36", "key_bits": 340,
+     "key_hex": "…", "raw_bits": 303963, "sifted_bits": 4816,
+     "qber": 0.0228, "qber_upper": 0.1427, "ec_method": "cascade",
+     "ec_efficiency": 1.189, "leaked_bits": 754, "authenticated": true,
+     "replenished_bits": 381, "auth_bits_remaining": 8192,
+     "error_type": null, "error_message": null}
+
+  Em aborto:   {"status": "aborted", ..., "error_type": "PostProcessingAbort",
+                "error_message": "QBER=27.46% acima do limite de 11.0% ..."}
+  Em erro:     {"status": "error", ..., "error_type": "FileNotFoundError", ...}
+
+  Regras para quem consome a saída:
+    * use a chave SOMENTE com status "ok" e authenticated = true;
+    * associe-a ao key_id (o outro nó terá o mesmo);
+    * não grave a linha JSON em logs nem em arquivos sem cifra.
+
+  Exemplo com o simulador, dois terminais (Bob exige o IP real de Alice):
+    python QKD_NODE.py session --role alice --capture-s 2 --simulate --json | gerenciador
+    python QKD_NODE.py session --role bob --peer-host 192.168.1.10 --capture-s 2 \
+                               --simulate --json | gerenciador
+
+11.6 Saída final de ALICE.py e BOB.py
+-------------------------------------
     === RESULTADOS FINAIS EM ALICE (ou BOB) ===
     Largura Total Peneirada: <bits após o sifting>
     Taxa QBER (amostra): x.xx%  (limite superior: y.yy%)
     Correção de erros (<método>): eficiência f = z.zzz, <N> bits revelados
-    Chave Secreta Final: <vetor de bits>
+    Chave Secreta Final (hex): <pack_bits da chave>
     Largura da Chave Secreta (Final Key Size): <bits>
+    ID da chave: <key_id>
     [SUCESSO] Chave segura e autenticada gerada em Alice/Bob.
         (ou, se a chave for vazia:)
     [ALERTA] Chave final vazia (custo de tamanho finito / QBER alta). Aumente a
     duração de captura.
 
-"<N> bits revelados" é `ec.leaked_bits` (inclui o hash de verificação). A
-"Chave bruta" impressa antes do sifting é o vetor de bits de todas as detecções
-(NumPy abrevia a exibição); não é um comprimento (ver observação 16.2).
+"<N> bits revelados" é `ec.leaked_bits` (inclui o hash de verificação). Antes
+do relatório são impressos os logs da sessão ("[ALICE] Chave gerada (não
+peneirada): <n> bits adquiridos.", "[ALICE] Chave peneirada (sifting): <n>
+bits" e as linhas [POS-ALICE] do pós-processamento).
 
-11.4 Códigos de situação
+11.7 Códigos de situação
 ------------------------
-  [ALICE][ERRO] / [BOB][ERRO]  nenhuma coincidência após o sifting.
-  [ALICE][ABORTADO] / [BOB][ABORTADO] <TipoDaExceção>: <msg>
-                               QBER alta, chave curta, verificação, autenticação,
-                               chave de autenticação esgotada, etc.
+  [ALICE][ABORTADO] / [BOB][ABORTADO] <Tipo>: <msg>
+        SiftingError        mensagem de sifting inválida ou SLOT_PS diferente;
+        NoCoincidences      nenhuma coincidência entre os nós;
+        PostProcessingAbort QBER alta, chave curta, verificação, comprimento final;
+        AuthenticationError transcrição adulterada / reservatórios dessincronizados;
+        AuthKeyExhausted    reservatório de autenticação esgotado.
   [ALERTA]                     execução correta, mas chave final vazia.
   [SUCESSO]                    chave final não vazia e autenticada.
+  Códigos de saída do QKD_NODE.py: ver 11.5.
 
 
 ================================================================================
@@ -1268,8 +1452,9 @@ Exemplo real (execução de 2 s, Cascade, valores variam por execução):
   * No modo simulado, as correlações quânticas são sorteadas por um gerador
     pseudoaleatório conhecido por ambos (seed=42): a chave resultante NÃO é
     segura. A simulação serve para validar o software e o desempenho.
-  * Os resultados impressos (inclusive a chave) vão para a saída padrão. Em
-    uso real, não imprima a chave final (observação 16.2).
+  * ALICE.py/BOB.py imprimem a chave na saída padrão (relatório de
+    demonstração). Em uso real, use `QKD_NODE.py session --json` ligado por
+    pipe a um gerenciador de chaves, que não exibe a chave (observação 16.2).
 
 
 ================================================================================
@@ -1382,7 +1567,7 @@ Dois pontos concentram a memória:
     assert (res["a"].final_key == res["b"].final_key).all()
 
 Se uma das threads levantar PostProcessingError, a outra pode ficar esperando;
-trate a exceção dentro de `run` (como em ALICE.py/BOB.py).
+trate a exceção dentro de `run` (como faz QKD_NODE.run_session).
 
 
 ================================================================================
@@ -1402,10 +1587,17 @@ trate a exceção dentro de `run` (como em ALICE.py/BOB.py).
   a Alice ... após 30s"                       firewall bloqueando a porta. Inicie
                                               Alice primeiro e libere CLASSIC_PORT.
 
-  "[...][ERRO] Nenhuma coincidência foi       Os dois mundos simulados divergem:
-  encontrada entre Alice e Bob"               seed, CAPTURE_S, pair_rate_hz ou flag de
-                                              espiã diferentes; versões de NumPy
-                                              diferentes; calibração de atraso errada.
+  "[...][ABORTADO] NoCoincidences: Nenhuma    Os dois mundos simulados divergem:
+  coincidência entre Alice e Bob ..."         seed, CAPTURE_S, pair_rate_hz, SIMULATE
+                                              ou flag de espiã diferentes; versões de
+                                              NumPy diferentes; calibração errada.
+
+  "[...][ABORTADO] SiftingError: ..."         Mensagem de sifting inválida ou SLOT_PS
+                                              diferente entre os nós.
+
+  ModuleNotFoundError: No module named        Driver real ausente e simulação
+  'Swabian'                                   desligada. Instale Swabian-TimeTagger
+                                              ou use SIMULATE=1 / --simulate.
 
   Programa trava em silêncio                  Não há timeout de leitura. Causas:
                                               EC_METHOD/parâmetros diferentes entre
@@ -1431,9 +1623,19 @@ trate a exceção dentro de `run` (como em ALICE.py/BOB.py).
                                               distribua um novo auth_key.json.
 
   FileNotFoundError auth_key.json             O reservatório não existe. Gere com
+                                              `python QKD_NODE.py auth-init ...` ou
                                               `python AUXILIARY.py --gen-auth-key ...`.
-                                              (Esta exceção NÃO é capturada por
-                                              ALICE.py/BOB.py; ocorre após o sifting.)
+                                              Desde a v0.2.0 o erro ocorre ANTES de
+                                              abrir a conexão (no modo --json vira
+                                              status "error").
+
+  "Recusado: --json escreve a chave em        stdout do QKD_NODE.py é um terminal.
+  stdout, que é um terminal"                  Ligue a saída a um pipe (gerenciador de
+                                              chaves) ou use --allow-tty em testes.
+
+  QKD_NODE.py --json termina com código 1     Erro de infraestrutura; veja
+  e status "error"                            error_type/error_message no JSON e os
+                                              logs em stderr.
 
   "Verificação da correção de erros falhou"   As chaves continuam diferentes após o EC
                                               (evento raro, prob. <= eps_cor).
@@ -1460,17 +1662,19 @@ trate a exceção dentro de `run` (como em ALICE.py/BOB.py).
 Itens observados na leitura dos arquivos. Nenhum impede o funcionamento no modo
 simulado; são pontos a conhecer (ou corrigir) antes de evoluir o projeto.
 
-16.1 BBM92.py está acoplado ao simulador
-  As duas primeiras linhas instalam o hardware simulado incondicionalmente. Para
-  hardware real é preciso removê-las (seção 17). Como ALICE.py/BOB.py também
-  instalam o simulador (com seed=42), a instalação em BBM92.py é redundante.
+16.1 Seleção entre hardware real e simulado (RESOLVIDO na v0.2.0)
+  As linhas de instalação do simulador em BBM92.py estão comentadas e não são
+  mais necessárias: QKD_NODE.run_session instala o SIMLINK (com semente) antes
+  de importar BBM92 quando simulate=True (SIMULATE=1 / --simulate). Não é
+  preciso editar código para alternar entre real e simulado (ver 6.1).
 
-16.2 Impressão de vetores e da chave secreta
-  * "Chave bruta: {key} bits" imprime o vetor NumPy inteiro (abreviado pelo
-    NumPy) em vez de um comprimento; provavelmente a intenção era imprimir
-    `sifted_len`.
-  * "Chave Secreta Final: {res.final_key}" escreve a chave na saída padrão
-    (terminal/logs). Em uso real, evite imprimir ou registrar a chave.
+16.2 Impressão da chave secreta
+  * (RESOLVIDO na v0.2.0) A linha "Chave bruta: {key} bits", que imprimia o
+    vetor NumPy inteiro, foi removida; os logs mostram apenas comprimentos.
+  * ALICE.py/BOB.py ainda imprimem "Chave Secreta Final (hex): ..." na saída
+    padrão, por serem programas de demonstração (print_report(show_key=True)).
+    Em uso real, use `QKD_NODE.py session --json` por pipe: a chave não passa
+    pelo terminal e a CLI se recusa a escrevê-la num TTY.
 
 16.3 Limiar de aborto
   O aborto por QBER compara o QBER da AMOSTRA com 11%, não o limite superior
@@ -1482,8 +1686,9 @@ simulado; são pontos a conhecer (ou corrigir) antes de evoluir o projeto.
   que cancela um desvio é o seu negativo. Em Bob, +12500/+12550 já cancelavam
   os desvios de -12500/-12550. Em Alice, os desvios intrínsecos são +50 ps
   nos canais 2 e 4, e a versão anterior calibrava com +50 em vez de -50,
-  levando o descasamento desses canais de 50 para ~100 ps. ALICE.py agora usa
-  {1: 0, 2: -50, 3: 0, 4: -50}, e o resíduo medido caiu para menos de 5 ps
+  levando o descasamento desses canais de 50 para ~100 ps. Agora Alice usa
+  {1: 0, 2: -50, 3: 0, 4: -50} (QKD_NODE.DEFAULT_DELAYS["alice"]), e o resíduo
+  medido caiu para menos de 5 ps
   (ver 6.5). O driver real aceita atrasos negativos em `setInputDelay`.
   O erro parecia irrelevante porque não alterava a TAXA de coincidências,
   mas os canais 2 e 4 são os detectores de bit 1 (V e A). Enquanto os
@@ -1494,9 +1699,10 @@ simulado; são pontos a conhecer (ou corrigir) antes de evoluir o projeto.
 
 16.5 Docstring e CLI do SIMLINK desatualizados em relação ao BBM92.py atual
   A docstring descreve um bloco `__main__` em BBM92.py que calibra só os canais
-  H/V (1, 2, 5, 6). O BBM92.py fornecido não tem bloco `__main__`, e ALICE.py/BOB.py
-  calibram os 4 canais de cada nó. Assim, `python SIMLINK.py` apenas importa
-  BBM92.py e não produz saída útil; o fluxo real é por ALICE.py e BOB.py.
+  H/V (1, 2, 5, 6). O BBM92.py fornecido não tem bloco `__main__`, e
+  QKD_NODE.run_session calibra os 4 canais de cada nó. Assim, `python SIMLINK.py`
+  apenas importa BBM92.py e não produz saída útil; o fluxo real é por
+  QKD_NODE.py (ou ALICE.py/BOB.py).
 
 16.6 Memória
   O simulador (~100 bytes por par gerado) e o `toeplitz_hash` (~9,5 bytes por
@@ -1505,11 +1711,13 @@ simulado; são pontos a conhecer (ou corrigir) antes de evoluir o projeto.
 16.7 Timeouts e exceções
   * O canal não tem timeout de leitura e `accept()` de Alice bloqueia sem
     limite; se um nó cair ou o roteiro divergir, o outro pode travar.
-  * ALICE.py/BOB.py só capturam `PostProcessingError`. Outras exceções
-    (FileNotFoundError do auth_key.json, ConnectionError, ValueError de um
-    EC_METHOD inválido, MemoryError) encerram o programa com traceback.
-  * `AuthKeyPool.load` é chamado depois do sifting; um auth_key.json ausente só
-    é descoberto no fim dessa etapa.
+  * run_session converte em status "aborted" apenas os erros do protocolo
+    (sifting inválido, 0 coincidências, PostProcessingError). Erros de
+    infraestrutura (FileNotFoundError, ConnectionError, ValueError de um
+    EC_METHOD inválido, MemoryError) encerram ALICE.py/BOB.py com traceback;
+    no QKD_NODE.py --json viram status "error" com código de saída 1.
+  * (RESOLVIDO na v0.2.0) `AuthKeyPool.load` agora é chamado antes de abrir a
+    conexão; um auth_key.json ausente é detectado de imediato.
 
 16.8 Sorteio da amostra de PE
   A amostra usa `RandomState(secrets.randbits(32))`: é imprevisível na prática,
@@ -1520,7 +1728,7 @@ simulado; são pontos a conhecer (ou corrigir) antes de evoluir o projeto.
 
 16.9 Utilitários presentes mas não usados no fluxo
   `BBM92ProtocolEngine.calculate_qber`, `run_bbm92` e a CLI do SIMLINK não fazem
-  parte do caminho ALICE.py/BOB.py.
+  parte do caminho QKD_NODE.run_session.
 
 16.10 Desempenho em Python puro
   `process_time_tags` e `perform_sifting` são vetorizados com NumPy. O sifting
@@ -1533,6 +1741,19 @@ simulado; são pontos a conhecer (ou corrigir) antes de evoluir o projeto.
   "pública e reprodutível" do pós-processamento (RandomState) é estável entre
   versões; o simulador (Generator) não é.
 
+16.12 Parâmetros iguais nos dois nós não são verificados
+  capture_s, slot_ps, ec_method, port, simulate e os parâmetros de
+  run_postprocessing devem coincidir (seção 5.2), mas nenhuma mensagem os
+  compara antes da captura. slot_ps divergente é detectado no sifting; os
+  demais podem fazer a sessão travar (não há timeout de leitura). Melhoria
+  sugerida: uma mensagem inicial com os parâmetros, trocada no canal e
+  incluída na transcrição autenticada, abortando se divergirem.
+
+16.13 Chave final em bits, não em bytes
+  key_hex é `pack_bits(final_key)`: quando key_bits não é múltiplo de 8, o
+  último byte é completado com zeros à direita. O consumidor deve usar
+  key_bits (ou descartar o byte incompleto, como faz o qpass).
+
 
 ================================================================================
 17. MIGRAÇÃO PARA HARDWARE REAL
@@ -1540,18 +1761,16 @@ simulado; são pontos a conhecer (ou corrigir) antes de evoluir o projeto.
 
   1. Instale o driver: `pip install Swabian-TimeTagger` (Linux e Windows) e
      conecte o(s) Time Tagger(s).
-  2. Remova o simulador:
-       * BBM92.py: apague `import SIMLINK` e a chamada
-         `SIMLINK.install_simulated_hardware(...)` (linhas 1-2);
-       * ALICE.py e BOB.py: apague `import SIMLINK` e a chamada
-         `SIMLINK.install_simulated_hardware(...)`.
-     O SIMLINK.py pode permanecer no diretório sem ser importado.
+  2. Desligue o simulador: basta NÃO usar SIMULATE=1 / --simulate. Com isso
+     o `import Swabian.TimeTagger` de BBM92.py carrega o driver real. Não é
+     preciso editar BBM92.py, ALICE.py nem BOB.py (as linhas do SIMLINK em
+     BBM92.py já estão comentadas). O SIMLINK.py pode permanecer no diretório.
   3. Se houver mais de um Time Tagger na máquina, passe o número de série:
-     `BBM92HardwareManager(node_type='Alice', serial_number='...')` (o
-     parâmetro existe, mas ALICE.py/BOB.py não o utilizam hoje).
-  4. Recalibre os atrasos: substitua os valores de `calibrate_delays` pelos
-     medidos no seu arranjo (por exemplo, por correlação cruzada entre os
-     timestamps de Alice e Bob). Atenção a dois pontos:
+     `--serial <SN>` no QKD_NODE.py ou `SessionConfig(serial_number=...)`.
+  4. Recalibre os atrasos: passe os valores medidos no seu arranjo com
+     `--delays '{"1": 0, "2": -37, ...}'` (ou `SessionConfig(delays=...)`), ou
+     atualize `QKD_NODE.DEFAULT_DELAYS`. Meça-os, por exemplo, por correlação
+     cruzada entre os timestamps de Alice e Bob. Atenção a dois pontos:
        - Sinal: `setInputDelay` SOMA o valor, então use atraso = -desvio
          (ver 6.5 e 16.4). Depois de calibrar, confira que o desvio médio
          de cada detector ficou próximo de zero.

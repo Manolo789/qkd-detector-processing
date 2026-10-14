@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+auth_key.json
+auth_key.json.tmp
